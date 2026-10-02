@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
+import config
+from calibration import is_calibrated
 from decision import CAUTION, LOCAL_TIMEZONE, WARNING
 from label_ko import to_korean
 from mic_health import MicStatusChange
@@ -89,6 +91,8 @@ def build_alert_payload(
         "timestamp": frame.timestamp,
         "source_mic_index": source_mic_index,
         "source_seq": source_seq,
+        # 선택 필드: 그 방이 소음계로 보정됐는지. 아니면 dB 값은 임시 오프셋 기준이다.
+        "calibrated": is_calibrated(frame.mic_name),
     }
 
 
@@ -121,6 +125,11 @@ class ConsoleSink:
             return
         header = f"[{LEVEL_LABEL[merged.level]}] {'+'.join(merged.rules)}"
         details = "\n".join(f"   - {message}" for message in merged.messages)
+        if not is_calibrated(frame.mic_name):
+            details += (
+                f"\n   (보정 안 됨: {frame.mic_name} dB는 임시 오프셋 "
+                f"+{config.DEFAULT_CALIBRATION_OFFSET_DB:.0f} 기준)"
+            )
         if merged.level == WARNING:
             border = "!" * ALERT_BANNER_WIDTH
             print(f"{border}\n!! {header}\n{details}\n{border}")

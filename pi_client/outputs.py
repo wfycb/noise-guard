@@ -51,11 +51,14 @@ class HardwareOutput(Protocol):
 
 
 def describe_alert(alert: AlertPayload) -> str:
-    """디스플레이 한 줄 요약: 방 · 소리 · 횟수 (규칙)."""
-    return (
+    """디스플레이 한 줄 요약: 방 · 소리 · 횟수 (규칙). 보정 안 된 방이면 표시를 붙인다."""
+    summary = (
         f"{alert['room']} · {alert['label_ko']} · {alert['count']}회 "
         f"({'+'.join(alert['rules'])}, 최대 {alert['peak_db']} dB(A))"
     )
+    if alert.get("calibrated") is False:
+        summary += " (보정 안 됨)"
+    return summary
 
 
 def describe_mic_status(status: DisplayStatus) -> str:

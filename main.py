@@ -24,6 +24,12 @@ import numpy
 
 import config
 from alert import AlertSink, ConsoleSink, NetworkSink
+from calibration import (
+    CalibrationFileError,
+    apply_calibration,
+    load_calibration,
+    warn_uncalibrated,
+)
 from capture import AudioSource, FileSource, MicSource
 from classifier import (
     CedClassifier,
@@ -145,6 +151,12 @@ def parse_arguments() -> argparse.Namespace:
         help="파일 모드: 파일이 끝나면 종료(stop)하거나 무음으로 계속(pad)",
     )
     parser.add_argument("--duration", type=float, help="이 시간(초)만큼 처리하고 종료")
+    parser.add_argument(
+        "--calibration-file",
+        type=Path,
+        default=Path(config.CALIBRATION_FILE),
+        help="소음계 보정 결과 (tools/calibrate.py가 만든 파일)",
+    )
     parser.add_argument(
         "--no-skip",
         action="store_true",
@@ -445,6 +457,9 @@ class RunResult:
     missing_ticks: dict[str, int] = field(default_factory=dict)
     mic_frames: int = 0  # 레벨을 낸 마이크-프레임 수
     skipped_mic_frames: int = 0  # 그중 조용해서 분류를 건너뛴 수
+    overrun_ticks: int = (
+        0  # 처리 지연이 hop을 넘은 tick 수 (실시간이 밀리기 시작한 신호)
+    )
 
 
 def run_sources(
@@ -500,6 +515,7 @@ def run_sources(
             result.skipped_mic_frames += item.skipped_mics
             if item.lag_ms is not None:
                 result.lag_ms.append(item.lag_ms)
+                report_processing_delay(item.lag_ms, result)
             judged = judge_category(frame.category_probs, config.CLASS_PROB_THRESHOLD)
             alerts = engine.update(frame)
             result.alerts.extend(alerts)
@@ -522,6 +538,18 @@ def run_sources(
         result.overflow_count = sum(source.overflow_count for source in sources)
         result.missing_ticks = tracker.missing_tick_counts()
     return result
+
+
+def report_processing_delay(lag_ms: float, result: RunResult) -> None:
+    """처리 지연이 hop을 넘으면 경고 로그를 남기고 센다 (side effect: 로그).
+
+    hop보다 오래 걸리는 tick이 이어지면 처리가 실시간을 따라가지 못해 지연이 쌓인다.
+    """
+    hop_ms = config.CLASSIFY_HOP_SEC * 1000.0
+    if lag_ms <= hop_ms:
+        return
+    result.overrun_ticks += 1
+    logging.getLogger(__name__).warning("[처리 지연] %.0f ms > %.0f ms", lag_ms, hop_ms)
 
 
 def report_mic_status(
@@ -575,6 +603,7 @@ def serve_network(
             )
             session.stream_start_time = last_frame_timestamp
         network_sink = NetworkSink(session, config.CLASSIFY_HOP_SEC)
+        warn_uncalibrated([source.name for source in session.sources])
         sinks: list[AlertSink] = (
             [network_sink] if notifier is None else [notifier, network_sink]
         )
@@ -639,9 +668,10 @@ def print_summary(result: RunResult) -> None:
         )
     if result.lag_ms:
         print(
-            f"실시간 지연(예정 시각 대비): 평균 {numpy.mean(result.lag_ms):.1f} ms, "
+            f"처리 지연: 평균 {numpy.mean(result.lag_ms):.1f} ms, "
             f"최대 {numpy.max(result.lag_ms):.1f} ms, "
-            f"마지막 {result.lag_ms[-1]:.1f} ms"
+            f"마지막 {result.lag_ms[-1]:.1f} ms, "
+            f"hop({config.CLASSIFY_HOP_SEC * 1000:.0f} ms) 초과 {result.overrun_ticks}회"
         )
 
 
@@ -692,11 +722,36 @@ def run_network_pipeline(
         print_network_stats(session_result.session)
 
 
+def load_and_apply_calibration(path: Path) -> None:
+    """보정 파일이 있으면 방별 오프셋을 적용한다 (side effect: 파일 읽기, config 변경, 로그)."""
+    try:
+        calibrations = load_calibration(path)
+    except CalibrationFileError as error:
+        raise SystemExit(f"보정 파일 오류: {error}") from error
+    apply_calibration(calibrations)
+    if calibrations:
+        logging.getLogger(__name__).info(
+            "보정 적용 (%s): %s",
+            path,
+            ", ".join(
+                f"{room} {value.offset_db:+.1f} dB"
+                for room, value in calibrations.items()
+            ),
+        )
+    else:
+        logging.getLogger(__name__).warning(
+            "보정 파일 %s가 없습니다. 모든 방에 임시 오프셋 +%.0f dB를 씁니다",
+            path,
+            config.DEFAULT_CALIBRATION_OFFSET_DB,
+        )
+
+
 def run_pipeline(arguments: argparse.Namespace) -> None:
     """인자로 소스·엔진을 만들고 실행한 뒤 요약을 출력한다 (side effect: 장치/파일/출력)."""
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+    load_and_apply_calibration(arguments.calibration_file)
     demo_mode = arguments.demo or config.DEMO_MODE
     engine = NoiseDecisionEngine(DecisionConfig.from_config(demo_mode=demo_mode))
     print("CED 로딩 중...")
@@ -720,9 +775,9 @@ def run_pipeline(arguments: argparse.Namespace) -> None:
     sources = build_sources(arguments)
     print(
         f"소스: {', '.join(f'{s.name}({s.sample_rate}Hz)' for s in sources)} | "
-        f"demo={demo_mode} | scope={config.AIRBORNE_SCOPE} | "
-        f"dB(A)는 보정 전 임시 오프셋 적용값"
+        f"demo={demo_mode} | scope={config.AIRBORNE_SCOPE}"
     )
+    warn_uncalibrated([source.name for source in sources])
     logger = CsvRunLogger(arguments.log_file) if arguments.log_file else None
     try:
         result = run_sources(

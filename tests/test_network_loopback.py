@@ -878,3 +878,32 @@ def test_client_detects_server_that_goes_silent(
     assert exit_code != 0
     assert "수신 없음" in client.lost_reasons[0]
     assert elapsed < 3.0
+
+
+class SlowStubClassifier(LevelStubClassifier):
+    """hop(1초)보다 오래 걸리는 분류기. 처리 지연 경고를 확인하기 위해서다."""
+
+    def classify(
+        self, batch: dict[str, numpy.ndarray]
+    ) -> dict[str, ClassificationResult]:
+        time.sleep(1.2)
+        return super().classify(batch)
+
+
+def test_processing_delay_over_hop_is_warned_and_counted(
+    server: AudioServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    run = start_serving(
+        server,
+        SlowStubClassifier(),
+        NoiseDecisionEngine(DecisionConfig.from_config(demo_mode=True)),
+    )
+    client = RawClient(server.address[1], ["거실"])
+    for seq, chunk in enumerate(chunks_of(make_signal(4.0, [], 0.0))):
+        client.send_chunk(0, seq, chunk)
+    with caplog.at_level(logging.WARNING, logger="main"):
+        client.finish()
+        result = finish(run)[0].result
+    assert result.overrun_ticks == len(result.lag_ms) > 0
+    assert max(result.lag_ms) > 1000.0
+    assert any("[처리 지연]" in record.getMessage() for record in caplog.records)

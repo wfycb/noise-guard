@@ -115,12 +115,18 @@ FAST_BLOCK_SEC: float = 0.125
 # Step 1에서 내장 마이크로 가까이서 말했을 때 약 -40 dBFS가 나왔고,
 # 일반 대화를 약 60 dB(A)로 보이게 하려고 100 dB로 잡았다. tools/calibrate.py로 대체한다.
 DEFAULT_CALIBRATION_OFFSET_DB: float = 100.0
-# 방 이름 → 오프셋. 보정 전이라 비어 있고, 전부 DEFAULT를 쓴다.
-# TODO(보정): tools/calibrate.py가 만든 calibration.json을 읽어 채운다.
+# 방 이름 → 오프셋. 서버 시작 시 calibration.json이 있으면 calibration.apply_calibration이 채운다.
+# 여기 없는 방은 DEFAULT(임시)를 쓰고 "보정 안 됨"으로 표시한다.
 CALIBRATION_OFFSET_DB: dict[str, float] = {}
 CALIBRATION_FILE: str = "calibration.json"
-# 핑크노이즈를 재생하며 마이크 레벨을 평균낼 시간. 소음계 Fast 값을 눈으로 읽어 평균내는 시간과 맞춘다.
+# 배경 소음·핑크노이즈를 측정할 시간. 소음계 Leq(또는 Fast 값 여러 번 평균)를 읽는 시간과 맞춘다.
 CALIBRATION_MEASURE_SEC: float = 10.0
+# 볼륨을 바꿔 여러 번 잰 오프셋의 차이가 이보다 크면 경고한다(마이크 AGC가 켜져 있으면 커짐).
+CALIBRATION_MAX_SPREAD_DB: float = 2.0
+# 배경 소음이 최저 판단 기준에서 이 값 이내면 오탐 위험으로 경고한다.
+CALIBRATION_BACKGROUND_NEAR_LIMIT_DB: float = 5.0
+# 권장 게이트 = min(배경 + 이 값, 최저 기준 − SKIP_MARGIN_DB). 배경 소음 프레임은 건너뛰되 여유를 둔다.
+CALIBRATION_GATE_HEADROOM_DB: float = 3.0
 
 # --- 마이크 매핑 (main.py --source mic) ---
 # 방 이름 → 장치 인덱스 또는 이름. 같은 모델 USB 마이크는 이름이 같을 수 있으니

@@ -191,3 +191,34 @@ def test_total_size_limit_deletes_oldest(tmp_path: Path) -> None:
     assert len(recorder.saved_folders) == 3
     assert recorder.deleted_folders == [recorder.saved_folders[0].name]
     assert remaining == [folder.name for folder in recorder.saved_folders[1:]]
+
+
+def test_same_virtual_time_twice_keeps_both_events(tmp_path: Path) -> None:
+    first = make_recorder(tmp_path)
+    run_ticks(first, range(1, 12), {5: [make_alert(5)]})
+    [first_folder] = first.saved_folders
+    original = {path.name: path.read_bytes() for path in first_folder.iterdir()}
+
+    second = make_recorder(tmp_path)
+    run_ticks(second, range(1, 12), {5: [make_alert(5)]})
+    [second_folder] = second.saved_folders
+
+    assert second_folder.name == f"{first_folder.name}_2"
+    assert sorted(path.name for path in (tmp_path / "events").iterdir()) == [
+        first_folder.name,
+        second_folder.name,
+    ]
+    assert {path.name: path.read_bytes() for path in first_folder.iterdir()} == original
+
+
+def test_unique_folder_counts_up(tmp_path: Path) -> None:
+    from event_recorder import create_unique_folder
+
+    names = [
+        create_unique_folder(tmp_path, "20261002_140003_R1").name for _ in range(3)
+    ]
+    assert names == [
+        "20261002_140003_R1",
+        "20261002_140003_R1_2",
+        "20261002_140003_R1_3",
+    ]

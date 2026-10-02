@@ -328,15 +328,27 @@ class EventRecorder:
             logger.info("이벤트 저장: %s", folder)
 
 
+def create_unique_folder(output_dir: Path, name: str) -> Path:
+    """name 폴더를 새로 만든다. 이미 있으면 name_2, name_3 … (side effect: 폴더 생성).
+
+    기존 폴더는 절대 덮어쓰지 않는다. 존재 확인과 생성 사이에 다른 프로세스가 같은 이름을 만들 수 있으므로,
+    확인 대신 생성 자체를 시도하고 이미 있으면 다음 번호로 넘어간다.
+    """
+    suffix = 1
+    while True:
+        folder = output_dir / (name if suffix == 1 else f"{name}_{suffix}")
+        try:
+            folder.mkdir()
+        except FileExistsError:
+            suffix += 1
+            continue
+        return folder
+
+
 def save_event(event: EventToSave, output_dir: Path) -> Path:
     """이벤트 폴더에 마이크별 wav(int16)와 meta.json을 쓴다 (side effect: 파일 쓰기)."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    folder = output_dir / event.folder_name
-    suffix = 2
-    while folder.exists():
-        folder = output_dir / f"{event.folder_name}_{suffix}"
-        suffix += 1
-    folder.mkdir()
+    folder = create_unique_folder(output_dir, event.folder_name)
     for room, samples in event.audio.items():
         pcm = numpy.clip(
             numpy.round(samples * INT16_FULL_SCALE),

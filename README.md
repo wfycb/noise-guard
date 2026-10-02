@@ -142,8 +142,25 @@ overflow 횟수, 배치 추론 지연, 실시간 지연이 들어 있습니다.
 
 ### 시나리오와 ESC-50 데이터
 
-시나리오는 [ESC-50][esc50]의 9개 클래스 클립 360개를 씁니다(약 150MB). `data/`는 git에 포함하지 않습니다.
-메타데이터 `meta/esc50.csv`와 필요한 `audio/*.wav`를 `data/esc50/` 아래에 같은 구조로 둡니다.
+시나리오는 [ESC-50][esc50]의 9개 클래스 클립 360개를 씁니다(약 150MB).
+
+> **`data/` 폴더는 저장소에 포함되지 않습니다.** ESC-50 클립, 생성한 시나리오 wav, 실행 로그가 모두
+> `data/` 아래에 있으며 아래 명령으로 다시 만들 수 있습니다.
+
+ESC-50 저장소 전체(약 600MB)를 받는 대신, 메타데이터와 대상 9개 클래스의 wav만 받습니다.
+프로젝트 루트의 Git Bash에서 실행합니다.
+
+```bash
+mkdir -p data/esc50/meta data/esc50/audio
+base=https://raw.githubusercontent.com/karolpiczak/ESC-50/master
+curl -sSfL -o data/esc50/meta/esc50.csv "$base/meta/esc50.csv"
+classes='footsteps|door_wood_knock|door_wood_creaks|toilet_flush|pouring_water|water_drops|clapping|dog|crying_baby'
+awk -F, -v pattern="^($classes)$" 'NR > 1 && $4 ~ pattern {print $1}' data/esc50/meta/esc50.csv \
+    | xargs -P 8 -I{} curl -sSfL -o data/esc50/audio/{} "$base/audio/{}"
+ls data/esc50/audio | wc -l   # 360이면 성공
+```
+
+받은 뒤 `.\.venv\Scripts\python.exe -m tools.make_scenario`로 `data/scenarios/`에 시나리오 wav를 만듭니다.
 
 | 시나리오 | 내용 | 기대 알림 (데모, 주간) |
 |---|---|---|

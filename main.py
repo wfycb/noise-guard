@@ -4,18 +4,21 @@
     .venv\\Scripts\\python main.py --source mic --mics 거실 --demo
     .venv\\Scripts\\python main.py --source file --files 거실=a.wav,안방=b.wav \\
         --demo --fast --start-time "2026-10-02 23:00" --log-file frames.csv
+    .venv\\Scripts\\python main.py --source network --demo
 """
 
 import argparse
 import csv
+import logging
 import queue
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 import numpy
 
@@ -32,6 +35,7 @@ from decision import (
 from fusion import fuse_measurements
 from level import LevelMeter, leq_db, to_estimated_dba
 from models import Alert, Category, Frame, MicMeasurement
+from server_net import AudioServer, ClientSession
 
 START_TIME_FORMAT = "%Y-%m-%d %H:%M"
 QUEUE_POLL_SEC = 0.5
@@ -92,8 +96,14 @@ def parse_start_time(text: str) -> float:
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="층간소음 경고 시스템 (Phase 1)")
-    parser.add_argument("--source", choices=["mic", "file"], default="mic")
+    parser = argparse.ArgumentParser(description="층간소음 경고 시스템")
+    parser.add_argument("--source", choices=["mic", "file", "network"], default="mic")
+    parser.add_argument(
+        "--host", default=config.SERVER_BIND_HOST, help="네트워크 bind 주소"
+    )
+    parser.add_argument(
+        "--port", type=int, default=config.SERVER_PORT, help="네트워크 포트"
+    )
     parser.add_argument(
         "--mics", help="사용할 방 이름 (쉼표 구분, config.MIC_DEVICES 중 일부)"
     )
@@ -105,7 +115,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--start-time",
         type=parse_start_time,
-        help=f'파일 모드 가상 시계 시작 시각 "{START_TIME_FORMAT}" (Asia/Seoul)',
+        help=f'파일·네트워크 모드 가상 시계 시작 시각 "{START_TIME_FORMAT}" (Asia/Seoul)',
     )
     parser.add_argument(
         "--fast", action="store_true", help="파일 모드: 대기 없이 가상 시계로 처리"
@@ -121,7 +131,11 @@ def parse_arguments() -> argparse.Namespace:
     if arguments.source == "file" and not arguments.files:
         parser.error("--source file 에는 --files 가 필요합니다")
     if arguments.source == "mic" and (arguments.start_time or arguments.fast):
-        parser.error("--start-time/--fast 는 파일 모드에서만 쓸 수 있습니다")
+        parser.error("--start-time/--fast 는 파일·네트워크 모드에서만 쓸 수 있습니다")
+    if arguments.source == "network" and arguments.fast:
+        parser.error(
+            "네트워크 모드는 오디오 도착에 맞춰 처리하므로 --fast가 필요 없습니다"
+        )
     return arguments
 
 
@@ -157,8 +171,11 @@ class FrameProducer(threading.Thread):
         realtime_pacing: bool,
         stop_when_exhausted: bool,
         duration_sec: float | None,
+        tick_ready_time: Callable[[int], float | None] | None = None,
     ) -> None:
-        super().__init__(name="frame-producer", daemon=True)
+        super().__init__(
+            name=f"{config.THREAD_NAME_PREFIX}-frame-producer", daemon=True
+        )
         self._sources = sources
         self._classifier = classifier
         self._output_queue = output_queue
@@ -166,6 +183,8 @@ class FrameProducer(threading.Thread):
         self._realtime_pacing = realtime_pacing
         self._stop_when_exhausted = stop_when_exhausted
         self._duration_sec = duration_sec
+        # 네트워크 소스: tick 구간 데이터가 모두 도착한 시각. 처리 지연(lag)을 재는 기준이다.
+        self._tick_ready_time = tick_ready_time
         self._level_meters = {
             source.name: LevelMeter(source.sample_rate) for source in sources
         }
@@ -204,10 +223,22 @@ class FrameProducer(threading.Thread):
             )
             if produced is None:
                 continue
-            if self._realtime_pacing:
-                lag_ms = (time.monotonic() - pacing_start - tick * hop_sec) * 1000.0
+            lag_ms = self._lag_ms(tick, pacing_start)
+            if lag_ms is not None:
                 produced = ProducedFrame(produced.frame, produced.inference_ms, lag_ms)
             self._output_queue.put(produced)
+
+    def _lag_ms(self, tick: int, pacing_start: float) -> float | None:
+        """tick 예정 시각(실시간 재생) 또는 데이터 도착 시각(네트워크) 대비 완성 지연."""
+        if self._realtime_pacing:
+            return (
+                time.monotonic() - pacing_start - tick * config.CLASSIFY_HOP_SEC
+            ) * 1000.0
+        if self._tick_ready_time is not None:
+            ready_time = self._tick_ready_time(tick)
+            if ready_time is not None:
+                return (time.monotonic() - ready_time) * 1000.0
+        return None
 
     def _measure_and_classify(self, timestamp: float) -> ProducedFrame | None:
         """소스마다 새 샘플로 레벨을, 최근 창으로 분류를 계산해 Frame 하나로 합친다."""
@@ -327,20 +358,23 @@ class RunResult:
     inference_ms: list[float] = field(default_factory=list)
     lag_ms: list[float] = field(default_factory=list)
     overflow_count: int = 0
+    interrupted: bool = (
+        False  # Ctrl+C로 끝났는지 (네트워크 모드에서 다음 연결을 기다릴지 결정)
+    )
 
 
 def run_sources(
     sources: list[AudioSource],
     classifier: CedClassifier,
     engine: NoiseDecisionEngine,
-    producer_options: dict[str, float | bool | None],
+    producer_options: dict[str, Any],
     notifier: ConsoleNotifier | None,
     logger: CsvRunLogger | None,
 ) -> RunResult:
     """소스를 시작하고 워커가 만든 프레임을 판단·출력·기록한다 (side effect: 장치/파일/출력).
 
     Ctrl+C를 받으면 그때까지의 결과를 반환한다. producer_options는 FrameProducer 인자
-    (start_timestamp, realtime_pacing, stop_when_exhausted, duration_sec)다.
+    (start_timestamp, realtime_pacing, stop_when_exhausted, duration_sec, tick_ready_time)다.
     """
     frame_queue: queue.Queue = queue.Queue()
     producer = FrameProducer(sources, classifier, frame_queue, **producer_options)
@@ -373,14 +407,66 @@ def run_sources(
                 logger.write_frame(frame, judged)
                 logger.write_alerts(alerts)
     except KeyboardInterrupt:
-        pass
+        result.interrupted = True
     finally:
         producer.stop_event.set()
-        producer.join()
+        # 네트워크 소스는 advance 안에서 데이터를 기다리므로, 소스를 먼저 닫아 깨운 뒤 join한다.
         for source in sources:
             source.close()
+        producer.join(config.THREAD_JOIN_TIMEOUT_SEC)
         result.overflow_count = sum(source.overflow_count for source in sources)
     return result
+
+
+@dataclass
+class SessionRunResult:
+    result: RunResult
+    session: ClientSession
+
+
+def serve_network(
+    server: AudioServer,
+    classifier: CedClassifier,
+    engine: NoiseDecisionEngine,
+    notifier: ConsoleNotifier | None,
+    logger: CsvRunLogger | None,
+    max_sessions: int | None = None,
+) -> list[SessionRunResult]:
+    """연결을 하나씩 받아 처리한다 (side effect: 소켓·출력). 엔진은 연결 사이에 유지한다.
+
+    max_sessions에 도달하거나 Ctrl+C를 받으면 끝난다. 연결 대기 중 Ctrl+C는 호출자에게 전달된다.
+    """
+    session_results: list[SessionRunResult] = []
+    while max_sessions is None or len(session_results) < max_sessions:
+        session = server.next_session(timeout=config.SERVER_THREAD_POLL_SEC)
+        if session is None:
+            continue
+        result = run_sources(
+            session.sources,
+            classifier,
+            engine,
+            producer_options={
+                "start_timestamp": session.stream_start_time,
+                "realtime_pacing": False,
+                "stop_when_exhausted": True,
+                "duration_sec": None,
+                "tick_ready_time": session.stream.tick_ready_time,
+            },
+            notifier=notifier,
+            logger=logger,
+        )
+        session.close("서버 중단" if result.interrupted else None)
+        session.join()
+        logging.getLogger(__name__).info(
+            "%s: 세션 종료 (%s), 프레임 %d",
+            session.address,
+            session.close_reason,
+            len(result.frames),
+        )
+        session_results.append(SessionRunResult(result, session))
+        if result.interrupted:
+            break
+    return session_results
 
 
 def print_summary(result: RunResult) -> None:
@@ -409,12 +495,60 @@ def print_summary(result: RunResult) -> None:
         )
 
 
+def print_network_stats(session: ClientSession) -> None:
+    """세션의 마이크별 수신 통계를 출력한다 (side effect: 콘솔 출력)."""
+    print(f"연결 {session.address}: {session.close_reason}")
+    for room, stats in session.stats().items():
+        print(
+            f"  {room}: 무음 채움 {stats.gap_filled_chunks}청크, "
+            f"늦게 와서 버림 {stats.late_discarded_samples}샘플, "
+            f"마감 초과 제외 {stats.stalled_ticks}tick, "
+            f"Pi overflow {stats.overflow_chunks}청크"
+        )
+
+
+def run_network_pipeline(
+    arguments: argparse.Namespace,
+    classifier: CedClassifier,
+    engine: NoiseDecisionEngine,
+    logger: CsvRunLogger | None,
+) -> None:
+    """서버를 열고 Ctrl+C까지 연결을 처리한다 (side effect: 소켓·출력)."""
+    server = AudioServer(
+        arguments.host, arguments.port, start_time=arguments.start_time
+    )
+    server.start()
+    session_results: list[SessionRunResult] = []
+    try:
+        session_results = serve_network(
+            server, classifier, engine, ConsoleNotifier(), logger
+        )
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.close()
+    for session_result in session_results:
+        print_summary(session_result.result)
+        print_network_stats(session_result.session)
+
+
 def run_pipeline(arguments: argparse.Namespace) -> None:
     """인자로 소스·엔진을 만들고 실행한 뒤 요약을 출력한다 (side effect: 장치/파일/출력)."""
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     demo_mode = arguments.demo or config.DEMO_MODE
     engine = NoiseDecisionEngine(DecisionConfig.from_config(demo_mode=demo_mode))
     print("CED 로딩 중...")
     classifier = CedClassifier()
+    if arguments.source == "network":
+        logger = CsvRunLogger(arguments.log_file) if arguments.log_file else None
+        try:
+            run_network_pipeline(arguments, classifier, engine, logger)
+        finally:
+            if logger:
+                logger.close()
+        return
     sources = build_sources(arguments)
     print(
         f"소스: {', '.join(f'{s.name}({s.sample_rate}Hz)' for s in sources)} | "

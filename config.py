@@ -111,6 +111,24 @@ CALIBRATION_MEASURE_SEC: float = 10.0
 # tools/list_devices.py 로 인덱스를 확인해 넣는다. 지금은 내장 마이크 하나뿐이다.
 MIC_DEVICES: dict[str, int | str] = {"거실": 18}
 
+# --- 네트워크 서버 (main.py --source network) ---
+# 모든 인터페이스에서 받는다. 배포 시에는 Pi와 직결한 랜 인터페이스 IP로 바꾸는 것을 권장한다.
+SERVER_BIND_HOST: str = "0.0.0.0"
+SERVER_PORT: int = 5000
+# 접속 직후 HELLO를 이 시간 안에 보내지 않으면 끊는다.
+HELLO_TIMEOUT_SEC: float = 5.0
+# 이 시간 동안 아무 메시지도 받지 못하면 끊긴 것으로 본다. 오디오가 계속 오므로 정상 연결에서는 걸리지 않는다.
+PEER_TIMEOUT_SEC: float = 6.0
+# 다른 마이크는 tick 분량이 도착했는데 한 마이크만 이 시간 넘게 늦으면, 그 tick에서 그 마이크를 뺀다.
+MIC_STALL_TIMEOUT_SEC: float = 2.0
+# 도착했지만 아직 처리하지 못한 오디오의 마이크별 최대 길이. 넘으면 서버가 너무 밀린 것이라 연결을 끊는다.
+NETWORK_BACKLOG_MAX_SEC: float = 60.0
+# 서버 스레드가 종료 요청을 확인하는 주기. 짧을수록 종료가 빠르고 CPU를 조금 더 쓴다.
+SERVER_THREAD_POLL_SEC: float = 0.2
+# 종료 시 스레드 join 대기 상한. 넘으면 남은 스레드를 경고로 남긴다.
+THREAD_JOIN_TIMEOUT_SEC: float = 5.0
+THREAD_NAME_PREFIX: str = "noise-guard"
+
 # --- tools/classify_live.py ---
 # 노트북 내장 마이크 배열의 WASAPI 장치 번호. 장치를 꽂고 빼면 바뀔 수 있으니
 # tools/list_devices.py 로 다시 확인한다.

@@ -15,11 +15,13 @@ from protocol import (
     PROTOCOL_VERSION,
     AudioChunk,
     ConnectionClosed,
+    FramingError,
     Hello,
     HelloAck,
     Message,
     MessageType,
     MicInfo,
+    PayloadError,
     ProtocolError,
     decode_alert,
     decode_audio,
@@ -320,3 +322,62 @@ def test_hello_with_boolean_index_is_protocol_error() -> None:
     )
     with pytest.raises(ProtocolError):
         decode_hello(body)
+
+
+# --- 오류 분류: 경계 오류(연결 끊기) vs 내용 오류(그 메시지만 무시) ---
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        LENGTH_PREFIX.pack(0),
+        LENGTH_PREFIX.pack(MAX_MESSAGE_BYTES + 1),
+        LENGTH_PREFIX.pack(1) + bytes([200]),
+    ],
+    ids=["zero_length", "too_long", "unknown_type"],
+)
+def test_broken_boundaries_are_framing_errors(stream: bytes) -> None:
+    with pytest.raises(FramingError):
+        read_message(FragmentedConnection(stream, 4096))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"\x00\x01",
+        AUDIO_HEADER.pack(0, 1, 0, 10) + numpy.zeros(9, numpy.int16).tobytes(),
+        AUDIO_HEADER.pack(0, 1, 0x2, 0),
+    ],
+    ids=["short_header", "sample_count_mismatch", "reserved_flags"],
+)
+def test_broken_audio_is_framing_error(body: bytes) -> None:
+    with pytest.raises(FramingError):
+        decode_audio(body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"{not json", b'{"level": "warning"}', b"[]"],
+    ids=["broken_json", "missing_fields", "not_object"],
+)
+def test_bad_alert_content_is_payload_error(body: bytes) -> None:
+    with pytest.raises(PayloadError):
+        decode_alert(body)
+
+
+def test_reader_keeps_going_after_payload_error() -> None:
+    # 경계가 정상이면 내용이 깨진 ALERT 다음 메시지도 그대로 읽을 수 있어야 한다.
+    stream = encode_message(MessageType.ALERT, b"{broken") + encode_message(
+        MessageType.ALERT, encode_alert(make_alert_payload())
+    )
+    connection = FragmentedConnection(stream, 5)
+    with pytest.raises(PayloadError):
+        decode_alert(read_message(connection).body)
+    assert decode_alert(read_message(connection).body)["room"] == "거실"
+
+
+def test_framing_and_payload_errors_are_distinct() -> None:
+    assert not issubclass(FramingError, PayloadError)
+    assert not issubclass(PayloadError, FramingError)
+    assert issubclass(FramingError, ProtocolError)
+    assert issubclass(PayloadError, ProtocolError)

@@ -1,9 +1,14 @@
 """오디오 입력 소스(마이크/파일)와 소스별 링버퍼 (side effect: 오디오 장치·파일 접근).
 
-MicSource와 FileSource는 같은 AudioSource 인터페이스를 가져 main.py에서 교체할 수 있다.
+MicSource, FileSource, NetworkSource는 같은 AudioSource 인터페이스를 가져 main.py에서
+교체할 수 있다.
 """
 
+import logging
 import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -225,3 +230,297 @@ class FileSource:
 
     def close(self) -> None:
         """파일 소스는 해제할 자원이 없다."""
+
+
+# --- 네트워크 소스 (Pi가 보낸 PCM) ---
+
+PCM_FULL_SCALE = 32768.0  # int16 → [-1, 1) 변환. read_wav_mono와 같은 기준이다.
+
+
+class BacklogOverflowError(Exception):
+    """처리하지 못한 수신 오디오가 상한을 넘었다. 서버가 실시간을 따라가지 못하는 상태다."""
+
+
+class InboundBuffer:
+    """도착했지만 아직 소비하지 않은 오디오. 절대 샘플 위치 [start, end)를 담는다."""
+
+    def __init__(self) -> None:
+        self._chunks: deque[numpy.ndarray] = deque()
+        self.start = 0
+        self.end = 0
+
+    def append(self, samples: numpy.ndarray) -> None:
+        if len(samples):
+            self._chunks.append(samples)
+            self.end += len(samples)
+
+    def take(self, sample_count: int) -> numpy.ndarray:
+        """앞에서 sample_count개를 꺼낸다. 호출 전에 충분히 있는지 확인해야 한다."""
+        if self.end - self.start < sample_count:
+            raise ValueError("버퍼에 요청한 만큼의 샘플이 없습니다")
+        pieces = []
+        remaining = sample_count
+        while remaining:
+            head = self._chunks[0]
+            if len(head) <= remaining:
+                pieces.append(self._chunks.popleft())
+                remaining -= len(head)
+            else:
+                pieces.append(head[:remaining])
+                self._chunks[0] = head[remaining:]
+                remaining = 0
+        self.start += sample_count
+        return numpy.concatenate(pieces) if pieces else numpy.zeros(0, numpy.int16)
+
+    def skip_to(self, position: int) -> int:
+        """position 앞의 샘플을 버리고 버린 개수를 반환한다. 아직 안 온 구간이면 위치만 옮긴다."""
+        discard_count = min(max(position - self.start, 0), self.end - self.start)
+        if discard_count:
+            self.take(discard_count)
+        self.end = max(self.end, position)
+        self.start = max(self.start, position)
+        return discard_count
+
+
+@dataclass
+class NetworkMicStats:
+    gap_filled_chunks: int = 0  # seq가 건너뛰어 무음으로 채운 청크 (Pi 쪽 드롭)
+    late_discarded_samples: int = 0  # 이미 지나간 tick 구간에 늦게 도착해 버린 샘플
+    stalled_ticks: int = 0  # 마감을 넘겨 빠진 tick
+    duplicate_chunks: int = 0  # 이미 받은 구간이 다시 온 청크
+    overflow_chunks: int = 0  # Pi 콜백 overflow flag가 켜진 청크
+
+
+@dataclass
+class _MicState:
+    room: str
+    sample_rate: int
+    hop_samples: int
+    inbound: InboundBuffer = field(default_factory=InboundBuffer)
+    stream_end: int = 0  # 지금까지 받은(무음 채움 포함) 스트림의 끝 위치
+    last_boundary: int = 0  # 도착 시각을 기록한 마지막 tick 경계
+    boundary_arrivals: dict[int, float] = field(default_factory=dict)
+    stats: NetworkMicStats = field(default_factory=NetworkMicStats)
+
+
+class NetworkStream:
+    """연결 하나의 마이크들이 공유하는 수신 버퍼와 tick 결정 (스레드 안전).
+
+    시간축은 오디오 샘플 수다. seq × chunk_samples가 그 청크의 절대 위치이고, 빈 seq는 무음으로
+    채운다. tick k는 마이크마다 [(k-1)·hop, k·hop) 구간을 소비한다.
+
+    tick 결정 규칙:
+    - 모든 마이크에 구간이 도착하면 바로 진행한다.
+    - 일부만 도착했으면, 처음 도착한 마이크의 도착 시각 + stall_timeout까지 기다린 뒤
+      도착한 마이크만으로 진행한다. 빠진 마이크의 그 구간은 나중에 와도 버린다.
+    - 아무 마이크도 도착하지 않았으면 계속 기다린다(시간축이 오디오 기준이라 나중에 따라잡는다).
+    - 연결이 닫히면 이미 도착한 구간까지만 처리하고 끝낸다.
+    """
+
+    def __init__(
+        self,
+        mics: list[tuple[int, str, int]],
+        chunk_samples: int,
+        hop_sec: float,
+        stall_timeout_sec: float,
+        backlog_max_sec: float,
+    ) -> None:
+        self.chunk_samples = chunk_samples
+        self.hop_sec = hop_sec
+        self._stall_timeout_sec = stall_timeout_sec
+        self._backlog_max_sec = backlog_max_sec
+        self._condition = threading.Condition()
+        self._closed = False
+        self._mics = {
+            index: _MicState(room, sample_rate, round(hop_sec * sample_rate))
+            for index, room, sample_rate in mics
+        }
+        self._decisions: dict[int, frozenset[int]] = {}
+        self._ready_times: dict[int, float] = {}
+        self.sources = [
+            NetworkSource(self, index, room, sample_rate)
+            for index, room, sample_rate in mics
+        ]
+
+    @property
+    def closed(self) -> bool:
+        with self._condition:
+            return self._closed
+
+    def has_mic(self, mic_index: int) -> bool:
+        return mic_index in self._mics
+
+    def stats(self) -> dict[str, NetworkMicStats]:
+        with self._condition:
+            return {state.room: state.stats for state in self._mics.values()}
+
+    def receive(
+        self, mic_index: int, seq: int, samples: numpy.ndarray, overflow: bool
+    ) -> None:
+        """수신 스레드가 AUDIO 청크를 넣는다. 처리 밀림이 상한을 넘으면 BacklogOverflowError."""
+        with self._condition:
+            state = self._mics[mic_index]
+            if overflow:
+                state.stats.overflow_chunks += 1
+            position = seq * self.chunk_samples
+            if position < state.stream_end:
+                overlap = state.stream_end - position
+                if overlap >= len(samples):
+                    state.stats.duplicate_chunks += 1
+                    return
+                samples = samples[overlap:]
+                position = state.stream_end
+            if position > state.stream_end:
+                gap = position - state.stream_end
+                state.stats.gap_filled_chunks += gap // self.chunk_samples
+                self._append(state, numpy.zeros(gap, dtype=numpy.int16))
+            self._append(state, samples)
+            self._record_boundary_arrivals(state, time.monotonic())
+            backlog_sec = (state.inbound.end - state.inbound.start) / state.sample_rate
+            self._condition.notify_all()
+        if backlog_sec > self._backlog_max_sec:
+            raise BacklogOverflowError(
+                f"{state.room}: 처리 대기 오디오 {backlog_sec:.1f}초가 "
+                f"상한 {self._backlog_max_sec}초를 넘었습니다"
+            )
+
+    def _append(self, state: _MicState, samples: numpy.ndarray) -> None:
+        start = state.stream_end
+        state.stream_end += len(samples)
+        consumed = state.inbound.start
+        if start < consumed:
+            discard_count = min(consumed - start, len(samples))
+            state.stats.late_discarded_samples += discard_count
+            samples = samples[discard_count:]
+        state.inbound.append(samples)
+
+    @staticmethod
+    def _record_boundary_arrivals(state: _MicState, now: float) -> None:
+        while (state.last_boundary + 1) * state.hop_samples <= state.stream_end:
+            state.last_boundary += 1
+            state.boundary_arrivals[state.last_boundary] = now
+
+    def close(self) -> None:
+        """연결 종료. 기다리는 tick 결정을 깨운다."""
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def decide_tick(self, tick: int) -> frozenset[int] | None:
+        """tick에 포함할 마이크 index 집합. 연결이 닫혀 더 진행할 수 없으면 None."""
+        with self._condition:
+            while tick not in self._decisions:
+                ready = frozenset(
+                    index
+                    for index, state in self._mics.items()
+                    if state.stream_end >= tick * state.hop_samples
+                )
+                if len(ready) == len(self._mics) or (self._closed and ready):
+                    self._record_decision(tick, ready)
+                elif self._closed:
+                    return None
+                elif ready:
+                    anchor = min(
+                        self._mics[index].boundary_arrivals[tick] for index in ready
+                    )
+                    remaining = anchor + self._stall_timeout_sec - time.monotonic()
+                    if remaining <= 0:
+                        self._record_decision(tick, ready)
+                    else:
+                        self._condition.wait(remaining)
+                else:
+                    self._condition.wait()
+            return self._decisions[tick]
+
+    def _record_decision(self, tick: int, ready: frozenset[int]) -> None:
+        self._decisions[tick] = ready
+        self._ready_times[tick] = max(
+            self._mics[index].boundary_arrivals[tick] for index in ready
+        )
+        for index, state in self._mics.items():
+            if index not in ready:
+                state.stats.stalled_ticks += 1
+                logging.getLogger(__name__).warning(
+                    "%s: tick %d 마감(%.1f초) 초과로 제외",
+                    state.room,
+                    tick,
+                    self._stall_timeout_sec,
+                )
+        # 모든 소스가 같은 tick을 조회한 뒤에는 필요 없으므로 오래된 기록을 지운다.
+        for old_tick in [old for old in self._decisions if old < tick - 1]:
+            del self._decisions[old_tick]
+            self._ready_times.pop(old_tick, None)
+        for state in self._mics.values():
+            for old_tick in [old for old in state.boundary_arrivals if old < tick - 1]:
+                del state.boundary_arrivals[old_tick]
+
+    def take(self, mic_index: int, include: bool) -> numpy.ndarray | None:
+        """tick 하나만큼 소비한다. 포함이면 그 구간 PCM(int16), 제외면 버리고 None."""
+        with self._condition:
+            state = self._mics[mic_index]
+            if include:
+                return state.inbound.take(state.hop_samples)
+            end = state.inbound.start + state.hop_samples
+            state.stats.late_discarded_samples += state.inbound.skip_to(end)
+            return None
+
+    def tick_ready_time(self, tick: int) -> float | None:
+        """tick에 포함된 마이크의 데이터가 모두 도착한 time.monotonic() 시각."""
+        with self._condition:
+            return self._ready_times.get(tick)
+
+
+class NetworkSource:
+    """NetworkStream의 마이크 하나를 AudioSource로 보여준다.
+
+    advance(hop)는 그 tick 구간이 도착할 때까지(또는 마감까지) 기다렸다가 정확히 hop만큼
+    링버퍼에 넣는다. 그래서 FrameProducer를 realtime_pacing=False로 돌리면 프레임 시각이
+    오디오 샘플 수 기준이 된다.
+    """
+
+    def __init__(
+        self, stream: NetworkStream, mic_index: int, name: str, sample_rate: int
+    ) -> None:
+        self.name = name
+        self.sample_rate = sample_rate
+        self.mic_index = mic_index
+        self._stream = stream
+        self._ring_buffer = RingBuffer(int(config.RING_BUFFER_SEC * sample_rate))
+        self._tick = 0
+        self._ended = False
+
+    @property
+    def overflow_count(self) -> int:
+        return self._stream.stats()[self.name].overflow_chunks
+
+    @property
+    def exhausted(self) -> bool:
+        return self._ended
+
+    def start(self) -> None:
+        """수신은 서버 수신 스레드가 하므로 할 일이 없다."""
+
+    def advance(self, duration_sec: float) -> None:
+        """다음 tick 구간을 기다렸다가 링버퍼에 넣는다 (side effect: 대기)."""
+        if abs(duration_sec - self._stream.hop_sec) > 1e-9:
+            raise ValueError(
+                f"advance({duration_sec})가 스트림 hop {self._stream.hop_sec}과 다릅니다"
+            )
+        self._tick += 1
+        included = self._stream.decide_tick(self._tick)
+        if included is None:
+            self._ended = True
+            return
+        samples = self._stream.take(self.mic_index, self.mic_index in included)
+        if samples is not None:
+            self._ring_buffer.write(samples.astype(numpy.float32) / PCM_FULL_SCALE)
+
+    def read_new(self, last_total_written: int) -> tuple[numpy.ndarray, int]:
+        return self._ring_buffer.read_new(last_total_written)
+
+    def latest(self, num_samples: int) -> numpy.ndarray | None:
+        return self._ring_buffer.latest(num_samples)
+
+    def close(self) -> None:
+        """스트림을 닫아 기다리는 advance를 깨운다."""
+        self._stream.close()

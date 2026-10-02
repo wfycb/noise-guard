@@ -1,0 +1,28 @@
+"""Pi 클라이언트 전용 상수. 서버의 config.py와 분리한다 (Pi에서 서버 모듈을 import하지 않기 위해)."""
+
+# --- 서버 연결 ---
+# README의 직결 랜 예시(노트북 192.168.10.1/24). 실행 시 --server로 바꿀 수 있다.
+SERVER_HOST: str = "192.168.10.1"
+SERVER_PORT: int = 5000
+CLIENT_ID: str = "pi-1"
+CONNECT_TIMEOUT_SEC: float = 5.0
+HELLO_ACK_TIMEOUT_SEC: float = 5.0
+# 파일 재생이 끝난 뒤 서버가 남은 오디오를 처리하고 마지막 알림을 보낼 때까지 기다리는 상한.
+DRAIN_TIMEOUT_SEC: float = 300.0
+
+# --- 수집 ---
+MIC_SAMPLE_RATE: int = 48000
+# 48kHz에서 100ms. 메시지 하나 = 마이크 1개의 청크 하나.
+CHUNK_SAMPLES: int = 4800
+# 방 이름 → sounddevice 장치 인덱스 또는 이름. tools/list_devices.py로 확인해 채운다.
+MIC_DEVICES: dict[str, int | str] = {}
+
+# --- 송신 ---
+# 네트워크가 막혀도 수집 콜백이 멈추지 않도록 큐 크기를 제한한다. 넘치면 가장 오래된 청크를 버린다.
+# 마이크 5개 × 100ms 청크 기준 약 4초 분량.
+SEND_QUEUE_MAX_CHUNKS: int = 200
+QUEUE_POLL_SEC: float = 0.2
+
+# --- 스레드 ---
+THREAD_JOIN_TIMEOUT_SEC: float = 5.0
+THREAD_NAME_PREFIX: str = "noise-guard-pi"

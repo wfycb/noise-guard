@@ -1,19 +1,26 @@
 """CED 로딩과 배치 추론.
 
 Phase 2에서는 CedClassifier.classify 를 같은 시그니처의 TCP 클라이언트로 교체한다.
+
+torch·transformers는 CedClassifier를 실제로 만들 때만 import한다. main.py의 파이프라인을
+가짜 분류기로 돌리는 테스트에서 수 초짜리 import를 피하기 위해서다.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from math import gcd
+from typing import TYPE_CHECKING
 
 import numpy
-import torch
 from scipy.signal import resample_poly
-from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 
 import config
 from label_map import AirborneScope, build_category_indices, category_probabilities
 from models import Category
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass(frozen=True)
@@ -34,6 +41,8 @@ def resample_for_classifier(samples: numpy.ndarray, source_rate: int) -> numpy.n
 
 def select_torch_device() -> torch.device:
     """CUDA → MPS → CPU 순으로 사용 가능한 장치를 고른다."""
+    import torch
+
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -45,6 +54,8 @@ class CedClassifier:
     """CED 모델 래퍼 (side effect: 생성 시 모델 다운로드/로딩)."""
 
     def __init__(self, airborne_scope: AirborneScope = config.AIRBORNE_SCOPE) -> None:
+        from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+
         self.device = select_torch_device()
         self._feature_extractor = AutoFeatureExtractor.from_pretrained(
             config.CED_MODEL_NAME,
@@ -64,6 +75,8 @@ class CedClassifier:
 
     def predict_probabilities(self, windows: list[numpy.ndarray]) -> numpy.ndarray:
         """16kHz 창 여러 개를 한 번의 forward로 추론해 (창 수, 라벨 수) 확률을 반환한다."""
+        import torch
+
         inputs = self._feature_extractor(
             windows,
             sampling_rate=config.CLASSIFIER_SAMPLE_RATE,

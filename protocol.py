@@ -49,7 +49,22 @@ class MessageType(IntEnum):
 
 
 class ProtocolError(Exception):
-    """규격 위반. 받는 쪽은 연결을 끊는다."""
+    """규격 위반의 공통 부모. 받는 쪽은 아래 두 하위 클래스로 처리 정책을 나눈다."""
+
+
+class FramingError(ProtocolError):
+    """메시지 경계가 깨졌다(길이, 타입, AUDIO 헤더·sample_count, 예약 flags).
+
+    다음 메시지의 시작 위치를 더 이상 믿을 수 없으므로 연결을 끊는다.
+    """
+
+
+class PayloadError(ProtocolError):
+    """경계는 정상인데 본문 내용이 잘못됐다(JSON 깨짐, 필드 누락·형식 오류).
+
+    다음 메시지는 정상적으로 읽을 수 있으므로, ALERT 같은 메시지는 경고 후 무시하고 계속한다.
+    HELLO는 핸드셰이크라 내용이 잘못되면 거부한다.
+    """
 
 
 class ConnectionClosed(Exception):
@@ -103,7 +118,7 @@ def encode_message(message_type: MessageType, body: bytes = b"") -> bytes:
     """길이 접두 + 타입 + 본문. 상한을 넘으면 보내기 전에 ProtocolError."""
     length = TYPE_BYTE.size + len(body)
     if length > MAX_MESSAGE_BYTES:
-        raise ProtocolError(
+        raise FramingError(
             f"메시지 길이 {length}가 상한 {MAX_MESSAGE_BYTES}를 넘습니다"
         )
     return LENGTH_PREFIX.pack(length) + TYPE_BYTE.pack(message_type) + body
@@ -131,9 +146,9 @@ def read_message(connection: Receivable) -> Message:
     """메시지 하나를 읽는다 (side effect: 소켓 읽기). 규격 위반은 ProtocolError."""
     (length,) = LENGTH_PREFIX.unpack(recv_exact(connection, LENGTH_PREFIX.size))
     if length < TYPE_BYTE.size:
-        raise ProtocolError(f"메시지 길이 {length}가 타입 바이트보다 짧습니다")
+        raise FramingError(f"메시지 길이 {length}가 타입 바이트보다 짧습니다")
     if length > MAX_MESSAGE_BYTES:
-        raise ProtocolError(
+        raise FramingError(
             f"메시지 길이 {length}가 상한 {MAX_MESSAGE_BYTES}를 넘습니다"
         )
     payload = recv_exact(connection, length)
@@ -141,7 +156,7 @@ def read_message(connection: Receivable) -> Message:
     try:
         message_type = MessageType(type_value)
     except ValueError as error:
-        raise ProtocolError(f"알 수 없는 메시지 타입 {type_value}") from error
+        raise FramingError(f"알 수 없는 메시지 타입 {type_value}") from error
     return Message(message_type, payload[TYPE_BYTE.size :])
 
 
@@ -163,9 +178,9 @@ def decode_json(body: bytes) -> dict[str, Any]:
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ProtocolError(f"JSON 본문을 해석할 수 없습니다: {error}") from error
+        raise PayloadError(f"JSON 본문을 해석할 수 없습니다: {error}") from error
     if not isinstance(payload, dict):
-        raise ProtocolError("JSON 본문은 객체여야 합니다")
+        raise PayloadError("JSON 본문은 객체여야 합니다")
     return payload
 
 
@@ -205,7 +220,7 @@ def decode_hello(body: bytes) -> Hello:
             chunk_samples=_require_int(payload["chunk_samples"]),
         )
     except (KeyError, TypeError) as error:
-        raise ProtocolError(f"HELLO 필드가 없거나 형식이 틀립니다: {error}") from error
+        raise PayloadError(f"HELLO 필드가 없거나 형식이 틀립니다: {error}") from error
 
 
 def _require_int(value: Any) -> int:
@@ -280,7 +295,7 @@ def decode_hello_ack(body: bytes) -> HelloAck:
             server_time=float(payload["server_time"]),
         )
     except (KeyError, TypeError, ValueError) as error:
-        raise ProtocolError(f"HELLO_ACK 형식이 틀립니다: {error}") from error
+        raise PayloadError(f"HELLO_ACK 형식이 틀립니다: {error}") from error
 
 
 # --- AUDIO ---
@@ -290,7 +305,7 @@ def encode_audio(chunk: AudioChunk) -> bytes:
     """AUDIO 본문 = 고정 헤더 + int16 little-endian PCM."""
     samples = numpy.ascontiguousarray(chunk.samples, dtype=PCM_DTYPE)
     if samples.ndim != 1 or len(samples) > MAX_CHUNK_SAMPLES:
-        raise ProtocolError(f"PCM은 1차원, 최대 {MAX_CHUNK_SAMPLES}샘플이어야 합니다")
+        raise FramingError(f"PCM은 1차원, 최대 {MAX_CHUNK_SAMPLES}샘플이어야 합니다")
     header = AUDIO_HEADER.pack(chunk.mic_index, chunk.seq, chunk.flags, len(samples))
     return header + samples.tobytes()
 
@@ -298,15 +313,15 @@ def encode_audio(chunk: AudioChunk) -> bytes:
 def decode_audio(body: bytes) -> AudioChunk:
     """AUDIO 본문을 읽는다. 헤더의 sample_count와 실제 길이가 다르면 ProtocolError."""
     if len(body) < AUDIO_HEADER.size:
-        raise ProtocolError(f"AUDIO 본문 {len(body)}바이트가 헤더보다 짧습니다")
+        raise FramingError(f"AUDIO 본문 {len(body)}바이트가 헤더보다 짧습니다")
     mic_index, seq, flags, sample_count = AUDIO_HEADER.unpack_from(body)
     pcm_bytes = body[AUDIO_HEADER.size :]
     if len(pcm_bytes) != sample_count * PCM_DTYPE.itemsize:
-        raise ProtocolError(
+        raise FramingError(
             f"sample_count {sample_count}와 PCM 길이 {len(pcm_bytes)}바이트가 맞지 않습니다"
         )
     if flags & ~KNOWN_FLAGS:
-        raise ProtocolError(f"예약된 flags 비트가 설정됨: {flags:#x}")
+        raise FramingError(f"예약된 flags 비트가 설정됨: {flags:#x}")
     samples = numpy.frombuffer(pcm_bytes, dtype=PCM_DTYPE)
     return AudioChunk(mic_index=mic_index, seq=seq, flags=flags, samples=samples)
 
@@ -333,7 +348,7 @@ ALERT_REQUIRED_FIELDS: tuple[str, ...] = (
 def encode_alert(payload: dict[str, Any]) -> bytes:
     missing = [field for field in ALERT_REQUIRED_FIELDS if field not in payload]
     if missing:
-        raise ProtocolError(f"ALERT 필수 필드 누락: {missing}")
+        raise PayloadError(f"ALERT 필수 필드 누락: {missing}")
     return encode_json(payload)
 
 
@@ -341,5 +356,5 @@ def decode_alert(body: bytes) -> dict[str, Any]:
     payload = decode_json(body)
     missing = [field for field in ALERT_REQUIRED_FIELDS if field not in payload]
     if missing:
-        raise ProtocolError(f"ALERT 필수 필드 누락: {missing}")
+        raise PayloadError(f"ALERT 필수 필드 누락: {missing}")
     return payload

@@ -94,6 +94,16 @@ SKIP_CLASSIFY_BELOW_DB: float = 24.0
 SKIP_MARGIN_DB: float = 10.0
 QUIET_TOP_LABEL: str = "(skipped: quiet)"
 
+# --- 이벤트 녹음 (데이터 수집용, 판단에는 쓰지 않음) ---
+EVENT_RECORDING_ENABLED: bool = True
+EVENT_DIR: str = "data/events"  # data/는 .gitignore에 있어 커밋되지 않는다
+EVENT_PRE_SEC: float = 2.0  # 알림 시각 앞
+EVENT_POST_SEC: float = 3.0  # 알림 시각 뒤
+# 녹음 중 새 알림이 오면 끝을 늦추되, 전체 길이는 이 값을 넘지 않는다(계속 시끄러울 때 파일이 무한히 커지지 않게).
+EVENT_MAX_SEC: float = 30.0
+# 이벤트 폴더 전체가 이 용량을 넘으면 가장 오래된 것부터 지운다.
+EVENT_MAX_TOTAL_MB: float = 500.0
+
 # --- tools/classify_file.py ---
 # 두 카테고리에 같은 값을 적용해 비교해 볼 후보값들 (config 조합은 항상 함께 출력).
 FILE_EVAL_THRESHOLDS: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5)

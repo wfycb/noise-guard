@@ -43,6 +43,7 @@ from decision import (
     NoiseDecisionEngine,
     judge_category,
 )
+from event_recorder import EventRecorder
 from fusion import fuse_measurements
 from level import LevelMeter, leq_db, to_estimated_dba
 from mic_health import MicPresenceTracker
@@ -87,6 +88,9 @@ class ProducedFrame:
     # 이번 tick에 레벨·분류를 낸 마이크. 빠진 마이크 경고에 쓴다.
     present_mics: frozenset[str]
     skipped_mics: int = 0  # 조용해서 CED에 넣지 않은 마이크 수
+    # 이벤트 녹음용: 이번 tick에 새로 들어온 원래 샘플레이트 오디오와 마이크별 측정값
+    new_audio: dict[str, numpy.ndarray] = field(default_factory=dict)
+    measurements: dict[str, MicMeasurement] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,9 @@ class TickWithoutFrame:
     """tick은 지났는데 레벨·분류를 낸 마이크가 하나도 없음(시작 직후 또는 전부 빠짐)."""
 
     timestamp: float
+    new_audio: dict[str, numpy.ndarray]  # 이벤트 녹음의 앞부분 버퍼용
+    # 분류 창이 차기 전 tick이면 False: 마이크 빠짐으로 세지 않는다.
+    counts_as_missing: bool
 
 
 class ProducerFinished:
@@ -156,6 +163,18 @@ def parse_arguments() -> argparse.Namespace:
         type=Path,
         default=Path(config.CALIBRATION_FILE),
         help="소음계 보정 결과 (tools/calibrate.py가 만든 파일)",
+    )
+    parser.add_argument(
+        "--record-events",
+        action=argparse.BooleanOptionalAction,
+        default=config.EVENT_RECORDING_ENABLED,
+        help="알림 앞뒤 오디오와 meta.json 저장 (--no-record-events로 끔)",
+    )
+    parser.add_argument(
+        "--event-dir",
+        type=Path,
+        default=Path(config.EVENT_DIR),
+        help="이벤트 저장 위치",
     )
     parser.add_argument(
         "--no-skip",
@@ -243,6 +262,7 @@ class FrameProducer(threading.Thread):
             source.name: deque(maxlen=window_block_count) for source in sources
         }
         self._total_read = {source.name: 0 for source in sources}
+        self._last_new_audio: dict[str, numpy.ndarray] = {}
         self.stop_event = threading.Event()
 
     def run(self) -> None:
@@ -283,8 +303,13 @@ class FrameProducer(threading.Thread):
                 ):
                     return
                 # 분류 창이 차기 전 tick은 어떤 마이크도 프레임을 낼 수 없으므로 빠짐으로 세지 않는다.
-                if tick * hop_sec >= config.CLASSIFY_WINDOW_SEC:
-                    self._output_queue.put(TickWithoutFrame(timestamp))
+                self._output_queue.put(
+                    TickWithoutFrame(
+                        timestamp,
+                        self._last_new_audio,
+                        counts_as_missing=tick * hop_sec >= config.CLASSIFY_WINDOW_SEC,
+                    )
+                )
                 continue
             lag_ms = self._lag_ms(tick, pacing_start)
             if lag_ms is not None:
@@ -294,6 +319,8 @@ class FrameProducer(threading.Thread):
                     lag_ms,
                     produced.present_mics,
                     produced.skipped_mics,
+                    produced.new_audio,
+                    produced.measurements,
                 )
             self._output_queue.put(produced)
 
@@ -315,12 +342,14 @@ class FrameProducer(threading.Thread):
 
     def _measure_and_classify(self, timestamp: float) -> ProducedFrame | None:
         """소스마다 새 샘플로 레벨을, 최근 창으로 분류를 계산해 Frame 하나로 합친다."""
+        self._last_new_audio = {}
         block_levels_by_name: dict[str, list[float]] = {}
         windows: dict[str, numpy.ndarray] = {}
         for source in self._sources:
             new_samples, self._total_read[source.name] = source.read_new(
                 self._total_read[source.name]
             )
+            self._last_new_audio[source.name] = new_samples
             block_levels = self._level_meters[source.name].push(new_samples)
             self._window_block_levels[source.name].extend(block_levels)
             window = source.latest(
@@ -369,6 +398,8 @@ class FrameProducer(threading.Thread):
             lag_ms=None,
             present_mics=frozenset(measurements),
             skipped_mics=len(windows) - len(loud_windows),
+            new_audio=self._last_new_audio,
+            measurements=measurements,
         )
 
 
@@ -469,6 +500,7 @@ def run_sources(
     producer_options: dict[str, Any],
     notifier: AlertSink | list[AlertSink] | None,
     logger: CsvRunLogger | None,
+    recorder: EventRecorder | None = None,
 ) -> RunResult:
     """소스를 시작하고 워커가 만든 프레임을 판단·출력·기록한다 (side effect: 장치/파일/출력).
 
@@ -485,6 +517,8 @@ def run_sources(
     frame_queue: queue.Queue = queue.Queue()
     producer = FrameProducer(sources, classifier, frame_queue, **producer_options)
     result = RunResult()
+    if recorder:
+        recorder.start_stream({source.name: source.sample_rate for source in sources})
     tracker = MicPresenceTracker(
         [source.name for source in sources],
         config.MIC_MISSING_WARN_TICKS,
@@ -504,7 +538,10 @@ def run_sources(
             if isinstance(item, Exception):
                 raise item
             if isinstance(item, TickWithoutFrame):
-                report_mic_status(tracker, item.timestamp, frozenset(), sinks)
+                if item.counts_as_missing:
+                    report_mic_status(tracker, item.timestamp, frozenset(), sinks)
+                if recorder:
+                    recorder.on_tick(item.timestamp, item.new_audio, None, {}, [])
                 continue
             frame = item.frame
             report_mic_status(tracker, frame.timestamp, item.present_mics, sinks)
@@ -527,6 +564,10 @@ def run_sources(
             if logger:
                 logger.write_frame(frame, judged)
                 logger.write_alerts(alerts)
+            if recorder:
+                recorder.on_tick(
+                    frame.timestamp, item.new_audio, frame, item.measurements, alerts
+                )
     except KeyboardInterrupt:
         result.interrupted = True
     finally:
@@ -581,6 +622,7 @@ def serve_network(
     logger: CsvRunLogger | None,
     max_sessions: int | None = None,
     skip_quiet_below_db: float | None = None,
+    recorder: EventRecorder | None = None,
 ) -> list[SessionRunResult]:
     """연결을 하나씩 받아 처리한다 (side effect: 소켓·출력). 엔진은 연결 사이에 유지한다.
 
@@ -621,6 +663,7 @@ def serve_network(
             },
             notifier=sinks,
             logger=logger,
+            recorder=recorder,
         )
         session.close("서버 중단" if result.interrupted else None)
         session.join()
@@ -697,6 +740,7 @@ def run_network_pipeline(
     classifier: CedClassifier,
     engine: NoiseDecisionEngine,
     logger: CsvRunLogger | None,
+    recorder: EventRecorder | None,
 ) -> None:
     """서버를 열고 Ctrl+C까지 연결을 처리한다 (side effect: 소켓·출력)."""
     server = AudioServer(
@@ -712,6 +756,7 @@ def run_network_pipeline(
             ConsoleSink(),
             logger,
             skip_quiet_below_db=skip_gate_db(arguments),
+            recorder=recorder,
         )
     except KeyboardInterrupt:
         pass
@@ -746,6 +791,28 @@ def load_and_apply_calibration(path: Path) -> None:
         )
 
 
+def build_recorder(
+    arguments: argparse.Namespace, classifier: CedClassifier, demo_mode: bool
+) -> EventRecorder | None:
+    """--record-events면 이벤트 녹음기를 만든다 (side effect: 저장 스레드)."""
+    if not arguments.record_events:
+        return None
+    logging.getLogger(__name__).info("이벤트 녹음: %s", arguments.event_dir)
+    return EventRecorder(
+        arguments.event_dir,
+        context={
+            "model": classifier.model_name,
+            "class_prob_threshold": {
+                category.value: threshold
+                for category, threshold in config.CLASS_PROB_THRESHOLD.items()
+            },
+            "skip_quiet_below_db": skip_gate_db(arguments),
+            "airborne_scope": config.AIRBORNE_SCOPE,
+            "demo_mode": demo_mode,
+        },
+    )
+
+
 def run_pipeline(arguments: argparse.Namespace) -> None:
     """인자로 소스·엔진을 만들고 실행한 뒤 요약을 출력한다 (side effect: 장치/파일/출력)."""
     logging.basicConfig(
@@ -764,10 +831,30 @@ def run_pipeline(arguments: argparse.Namespace) -> None:
             else f"Leq < {config.SKIP_CLASSIFY_BELOW_DB} dB(A) (보정 전 임시 기준)"
         )
     )
+    recorder = build_recorder(arguments, classifier, demo_mode)
+    try:
+        run_with_recorder(arguments, classifier, engine, demo_mode, recorder)
+    finally:
+        if recorder:
+            recorder.close()
+            if recorder.saved_folders:
+                print(
+                    f"이벤트 {len(recorder.saved_folders)}개 저장: {arguments.event_dir}"
+                )
+
+
+def run_with_recorder(
+    arguments: argparse.Namespace,
+    classifier: CedClassifier,
+    engine: NoiseDecisionEngine,
+    demo_mode: bool,
+    recorder: EventRecorder | None,
+) -> None:
+    """소스 종류별로 실행한다 (side effect: 장치/파일/소켓/출력)."""
     if arguments.source == "network":
         logger = CsvRunLogger(arguments.log_file) if arguments.log_file else None
         try:
-            run_network_pipeline(arguments, classifier, engine, logger)
+            run_network_pipeline(arguments, classifier, engine, logger, recorder)
         finally:
             if logger:
                 logger.close()
@@ -794,6 +881,7 @@ def run_pipeline(arguments: argparse.Namespace) -> None:
             },
             notifier=ConsoleSink(),
             logger=logger,
+            recorder=recorder,
         )
     finally:
         if logger:

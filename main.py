@@ -13,7 +13,7 @@ import logging
 import queue
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -25,7 +25,12 @@ import numpy
 import config
 from alert import AlertSink, ConsoleSink, NetworkSink
 from capture import AudioSource, FileSource, MicSource
-from classifier import CedClassifier, resample_for_classifier
+from classifier import (
+    CedClassifier,
+    judgment_limits_db,
+    resample_for_classifier,
+    validate_skip_gate,
+)
 from decision import (
     LOCAL_TIMEZONE,
     DecisionConfig,
@@ -39,6 +44,8 @@ from models import Alert, Category, Frame, MicMeasurement
 from server_net import AudioServer, ClientSession
 
 START_TIME_FORMAT = "%Y-%m-%d %H:%M"
+# argparse는 help 문자열을 % 포맷으로 처리하므로 strftime 형식의 %를 %%로 바꿔 넣는다.
+START_TIME_FORMAT_FOR_HELP = START_TIME_FORMAT.replace("%", "%%")
 QUEUE_POLL_SEC = 0.5
 FRAME_CSV_COLUMNS = [
     "timestamp",
@@ -68,11 +75,12 @@ ALERT_LOG_SUFFIX = "_alerts"
 @dataclass(frozen=True)
 class ProducedFrame:
     frame: Frame
-    inference_ms: float
+    inference_ms: float | None  # 모든 마이크가 조용해 분류를 건너뛰었으면 None
     # 실시간 재생에서 예정 시각(tick) 대비 프레임 완성이 늦은 정도. 누적되면 처리량이 부족한 것이다.
     lag_ms: float | None
     # 이번 tick에 레벨·분류를 낸 마이크. 빠진 마이크 경고에 쓴다.
     present_mics: frozenset[str]
+    skipped_mics: int = 0  # 조용해서 CED에 넣지 않은 마이크 수
 
 
 @dataclass(frozen=True)
@@ -125,7 +133,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--start-time",
         type=parse_start_time,
-        help=f'파일·네트워크 모드 가상 시계 시작 시각 "{START_TIME_FORMAT}" (Asia/Seoul)',
+        help=f'파일·네트워크 모드 가상 시계 시작 시각 "{START_TIME_FORMAT_FOR_HELP}" (Asia/Seoul)',
     )
     parser.add_argument(
         "--fast", action="store_true", help="파일 모드: 대기 없이 가상 시계로 처리"
@@ -137,6 +145,17 @@ def parse_arguments() -> argparse.Namespace:
         help="파일 모드: 파일이 끝나면 종료(stop)하거나 무음으로 계속(pad)",
     )
     parser.add_argument("--duration", type=float, help="이 시간(초)만큼 처리하고 종료")
+    parser.add_argument(
+        "--no-skip",
+        action="store_true",
+        help="조용한 마이크도 모두 CED로 분류 (SKIP_CLASSIFY_BELOW_DB 게이트 끄기)",
+    )
+    parser.add_argument(
+        "--model",
+        choices=list(config.CED_MODELS),
+        default=config.CED_MODEL_SIZE,
+        help="CED 모델 크기",
+    )
     arguments = parser.parse_args()
     if arguments.source == "file" and not arguments.files:
         parser.error("--source file 에는 --files 가 필요합니다")
@@ -182,7 +201,12 @@ class FrameProducer(threading.Thread):
         stop_when_exhausted: bool,
         duration_sec: float | None,
         tick_ready_time: Callable[[int], float | None] | None = None,
+        skip_quiet_below_db: float | None = None,
     ) -> None:
+        if skip_quiet_below_db is not None:
+            validate_skip_gate(
+                skip_quiet_below_db, config.SKIP_MARGIN_DB, judgment_limits_db()
+            )
         super().__init__(
             name=f"{config.THREAD_NAME_PREFIX}-frame-producer", daemon=True
         )
@@ -195,8 +219,16 @@ class FrameProducer(threading.Thread):
         self._duration_sec = duration_sec
         # 네트워크 소스: tick 구간 데이터가 모두 도착한 시각. 처리 지연(lag)을 재는 기준이다.
         self._tick_ready_time = tick_ready_time
+        # None이면 모든 마이크를 분류한다(--no-skip). 값이 있으면 분류 창(2초) 전체의 Leq가 그보다 낮은
+        # 마이크는 건너뛴다. 1초 Leq로 보면, 큰 소리가 막 끝난 프레임(창 안에는 그 소리가 있어 CED가
+        # IMPACT로 보는 프레임)까지 건너뛰어 이벤트 병합이 달라지고 알림이 --no-skip과 달라진다.
+        self._skip_quiet_below_db = skip_quiet_below_db
         self._level_meters = {
             source.name: LevelMeter(source.sample_rate) for source in sources
+        }
+        window_block_count = round(config.CLASSIFY_WINDOW_SEC / config.FAST_BLOCK_SEC)
+        self._window_block_levels = {
+            source.name: deque(maxlen=window_block_count) for source in sources
         }
         self._total_read = {source.name: 0 for source in sources}
         self.stop_event = threading.Event()
@@ -245,7 +277,11 @@ class FrameProducer(threading.Thread):
             lag_ms = self._lag_ms(tick, pacing_start)
             if lag_ms is not None:
                 produced = ProducedFrame(
-                    produced.frame, produced.inference_ms, lag_ms, produced.present_mics
+                    produced.frame,
+                    produced.inference_ms,
+                    lag_ms,
+                    produced.present_mics,
+                    produced.skipped_mics,
                 )
             self._output_queue.put(produced)
 
@@ -261,6 +297,10 @@ class FrameProducer(threading.Thread):
                 return (time.perf_counter() - ready_time) * 1000.0
         return None
 
+    def _window_leq_db(self, name: str) -> float:
+        """분류 창(CLASSIFY_WINDOW_SEC)과 같은 구간의 Leq, 추정 dB(A)."""
+        return to_estimated_dba(leq_db(list(self._window_block_levels[name])), name)
+
     def _measure_and_classify(self, timestamp: float) -> ProducedFrame | None:
         """소스마다 새 샘플로 레벨을, 최근 창으로 분류를 계산해 Frame 하나로 합친다."""
         block_levels_by_name: dict[str, list[float]] = {}
@@ -270,6 +310,7 @@ class FrameProducer(threading.Thread):
                 self._total_read[source.name]
             )
             block_levels = self._level_meters[source.name].push(new_samples)
+            self._window_block_levels[source.name].extend(block_levels)
             window = source.latest(
                 round(config.CLASSIFY_WINDOW_SEC * source.sample_rate)
             )
@@ -282,24 +323,40 @@ class FrameProducer(threading.Thread):
         if not windows:
             return None
 
-        inference_start = time.perf_counter()
-        results = self._classifier.classify(windows)
-        inference_ms = (time.perf_counter() - inference_start) * 1000.0
-
-        measurements = {
-            name: MicMeasurement(
-                leq_db=to_estimated_dba(leq_db(block_levels_by_name[name]), name),
-                lmax_db=to_estimated_dba(max(block_levels_by_name[name]), name),
-                category_probs=result.category_probs,
-                top_label=result.top_labels[0][0],
-            )
-            for name, result in results.items()
+        leq_by_name = {
+            name: to_estimated_dba(leq_db(levels), name)
+            for name, levels in block_levels_by_name.items()
         }
+        # 조용한 마이크는 분류하지 않는다. "크면 분류 없이 통과"는 하지 않는다(물소리를 못 거르므로).
+        loud_windows = {
+            name: window
+            for name, window in windows.items()
+            if self._skip_quiet_below_db is None
+            or self._window_leq_db(name) >= self._skip_quiet_below_db
+        }
+        inference_ms = None
+        results = {}
+        if loud_windows:
+            inference_start = time.perf_counter()
+            results = self._classifier.classify(loud_windows)
+            inference_ms = (time.perf_counter() - inference_start) * 1000.0
+
+        quiet_probs = {category: 0.0 for category in Category}
+        measurements = {}
+        for name, levels in block_levels_by_name.items():
+            result = results.get(name)
+            measurements[name] = MicMeasurement(
+                leq_db=leq_by_name[name],
+                lmax_db=to_estimated_dba(max(levels), name),
+                category_probs=result.category_probs if result else quiet_probs,
+                top_label=result.top_labels[0][0] if result else config.QUIET_TOP_LABEL,
+            )
         return ProducedFrame(
             fuse_measurements(timestamp, measurements),
             inference_ms,
             lag_ms=None,
             present_mics=frozenset(measurements),
+            skipped_mics=len(windows) - len(loud_windows),
         )
 
 
@@ -386,6 +443,8 @@ class RunResult:
     interrupted: bool = False
     # 마이크별로 tick에서 빠진 횟수 (분류 창이 차기 전 tick은 제외)
     missing_ticks: dict[str, int] = field(default_factory=dict)
+    mic_frames: int = 0  # 레벨을 낸 마이크-프레임 수
+    skipped_mic_frames: int = 0  # 그중 조용해서 분류를 건너뛴 수
 
 
 def run_sources(
@@ -435,7 +494,10 @@ def run_sources(
             frame = item.frame
             report_mic_status(tracker, frame.timestamp, item.present_mics, sinks)
             result.frames.append(frame)
-            result.inference_ms.append(item.inference_ms)
+            if item.inference_ms is not None:
+                result.inference_ms.append(item.inference_ms)
+            result.mic_frames += len(item.present_mics)
+            result.skipped_mic_frames += item.skipped_mics
             if item.lag_ms is not None:
                 result.lag_ms.append(item.lag_ms)
             judged = judge_category(frame.category_probs, config.CLASS_PROB_THRESHOLD)
@@ -490,6 +552,7 @@ def serve_network(
     notifier: AlertSink | None,
     logger: CsvRunLogger | None,
     max_sessions: int | None = None,
+    skip_quiet_below_db: float | None = None,
 ) -> list[SessionRunResult]:
     """연결을 하나씩 받아 처리한다 (side effect: 소켓·출력). 엔진은 연결 사이에 유지한다.
 
@@ -525,6 +588,7 @@ def serve_network(
                 "stop_when_exhausted": True,
                 "duration_sec": None,
                 "tick_ready_time": session.stream.tick_ready_time,
+                "skip_quiet_below_db": skip_quiet_below_db,
             },
             notifier=sinks,
             logger=logger,
@@ -558,6 +622,11 @@ def print_summary(result: RunResult) -> None:
         f"규칙별 {dict(sorted(rule_counts.items()))}"
     )
     print(f"overflow: {result.overflow_count}")
+    if result.mic_frames:
+        print(
+            f"분류 건너뜀(조용함): {result.skipped_mic_frames}/{result.mic_frames} "
+            f"마이크-프레임 ({100 * result.skipped_mic_frames / result.mic_frames:.0f}%)"
+        )
     if result.missing_ticks:
         missing_text = ", ".join(
             f"{name} {count}" for name, count in result.missing_ticks.items()
@@ -588,6 +657,11 @@ def print_network_stats(session: ClientSession) -> None:
         )
 
 
+def skip_gate_db(arguments: argparse.Namespace) -> float | None:
+    """--no-skip이면 None(모두 분류), 아니면 config의 게이트 값."""
+    return None if arguments.no_skip else config.SKIP_CLASSIFY_BELOW_DB
+
+
 def run_network_pipeline(
     arguments: argparse.Namespace,
     classifier: CedClassifier,
@@ -602,7 +676,12 @@ def run_network_pipeline(
     session_results: list[SessionRunResult] = []
     try:
         session_results = serve_network(
-            server, classifier, engine, ConsoleSink(), logger
+            server,
+            classifier,
+            engine,
+            ConsoleSink(),
+            logger,
+            skip_quiet_below_db=skip_gate_db(arguments),
         )
     except KeyboardInterrupt:
         pass
@@ -621,7 +700,15 @@ def run_pipeline(arguments: argparse.Namespace) -> None:
     demo_mode = arguments.demo or config.DEMO_MODE
     engine = NoiseDecisionEngine(DecisionConfig.from_config(demo_mode=demo_mode))
     print("CED 로딩 중...")
-    classifier = CedClassifier()
+    classifier = CedClassifier(model_size=arguments.model)
+    print(
+        f"모델: {classifier.model_name} | 조용할 때 분류 건너뛰기: "
+        + (
+            "끔"
+            if arguments.no_skip
+            else f"Leq < {config.SKIP_CLASSIFY_BELOW_DB} dB(A) (보정 전 임시 기준)"
+        )
+    )
     if arguments.source == "network":
         logger = CsvRunLogger(arguments.log_file) if arguments.log_file else None
         try:
@@ -648,6 +735,7 @@ def run_pipeline(arguments: argparse.Namespace) -> None:
                 "stop_when_exhausted": arguments.source == "file"
                 and arguments.file_end == "stop",
                 "duration_sec": arguments.duration,
+                "skip_quiet_below_db": skip_gate_db(arguments),
             },
             notifier=ConsoleSink(),
             logger=logger,

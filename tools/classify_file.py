@@ -219,6 +219,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--verbose", action="store_true", help="폴더 모드에서도 창별 결과 출력"
     )
+    parser.add_argument(
+        "--model", choices=list(config.CED_MODELS), default=config.CED_MODEL_SIZE
+    )
     return parser.parse_args()
 
 
@@ -232,8 +235,10 @@ def main() -> None:
     threshold_sets = [
         uniform_thresholds(float(value)) for value in arguments.thresholds.split(",")
     ] + [thresholds]
-    classifier = CedClassifier(airborne_scope=arguments.scope)
-    print(f"AIRBORNE scope={arguments.scope}")
+    classifier = CedClassifier(
+        airborne_scope=arguments.scope, model_size=arguments.model
+    )
+    print(f"AIRBORNE scope={arguments.scope}, model={classifier.model_name}")
 
     if arguments.input_path.is_file():
         window_results = classify_wav(classifier, arguments.input_path)

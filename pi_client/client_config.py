@@ -34,6 +34,8 @@ QUEUE_POLL_SEC: float = 0.2
 LED_BLINK_COUNT: int = 3  # caution: LED 점멸 횟수
 LED_BLINK_INTERVAL_SEC: float = 0.25
 DISPLAY_HOLD_SEC: float = 10.0  # warning: 디스플레이 표시 유지 시간
+# 서버 연결이 끊긴 동안 "N초째" 표시를 이 간격으로 갱신한다.
+DISCONNECT_STATUS_REFRESH_SEC: float = 5.0
 
 # --- 종단 지연 측정 ---
 # ALERT의 source_seq로 캡처 시각을 찾기 위해 seq별 캡처 시각을 이 시간만큼 기억한다.

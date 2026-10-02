@@ -216,6 +216,7 @@ class PiClient:
             if not accepted:
                 return SessionOutcome.REJECTED
             self.connections += 1
+            self._outputs.submit_connection(True)
             if disconnected_at is not None:
                 self._report_reconnect(disconnected_at, dropped_at_disconnect)
             self._link_lost.clear()
@@ -318,6 +319,7 @@ class PiClient:
         if not self._link_lost.is_set():
             self.lost_reasons.append(reason)
             logger.warning("연결 끊김 — %s", reason)
+            self._outputs.submit_connection(False)
         self._link_lost.set()
 
     def _remember_capture_time(

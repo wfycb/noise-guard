@@ -13,9 +13,14 @@ CAPTURE_DTYPE: str = "float32"
 RING_BUFFER_SEC: float = 4.0
 
 # --- 분류 (CED) ---
-CED_MODEL_NAME: str = "mispeech/ced-base"
-# trust_remote_code라서 원격 코드가 바뀌면 동작이 달라질 수 있으므로 검증한 커밋에 고정한다.
-CED_MODEL_REVISION: str = "db3e14a8db4c21b56b165261c39649741a900e7f"
+# 모델 크기 → (HF 모델 이름, 커밋). trust_remote_code라서 원격 코드가 바뀌면 동작이 달라질 수 있으므로
+# 검증한 커밋에 고정한다. 두 모델 모두 라벨 527개 순서가 같고 pooling=mean(출력이 sigmoid 확률)임을 확인했다.
+CED_MODELS: dict[str, tuple[str, str]] = {
+    "base": ("mispeech/ced-base", "db3e14a8db4c21b56b165261c39649741a900e7f"),
+    "mini": ("mispeech/ced-mini", "26c3ebcae85d4330f4fc26763f029539a3afcda0"),
+}
+CED_MODEL_SIZE: str = "base"
+CED_MODEL_NAME, CED_MODEL_REVISION = CED_MODELS[CED_MODEL_SIZE]
 CLASSIFIER_SAMPLE_RATE: int = 16000
 CLASSIFY_WINDOW_SEC: float = 2.0
 CLASSIFY_HOP_SEC: float = 1.0
@@ -77,6 +82,17 @@ FRAME_SEC: float = CLASSIFY_HOP_SEC
 # 이 레벨로 채운다. "분류된 소음의 기여분만 본다"는 설계라 다른 구간의 기여는 0에 가까워야 하므로
 # 기준값(34~57 dB(A))보다 충분히 낮은 0 dB(A)로 둔다 (60초 창 전체를 채워도 기여 0 dB(A)).
 LEQ_FLOOR_DB: float = 0.0
+
+# --- 조용할 때 분류 건너뛰기 ---
+# 마이크의 분류 창(2초) Leq(추정 dB(A))가 이 값보다 낮으면 그 마이크는 CED에 넣지 않는다(확률 0).
+# 1초가 아니라 분류 창 전체로 보는 이유: 창 안에 큰 소리가 있으면 CED가 IMPACT로 볼 수 있으므로
+# 그런 프레임을 건너뛰면 이벤트 병합이 달라져 --no-skip과 알림이 달라진다.
+# 판단 기준 중 가장 낮은 값(야간 R3 34)에서 SKIP_MARGIN_DB를 뺀 값 이하여야 한다. 기준 근처 소리를
+# 건너뛰면 R3/R4 Leq가 과소평가되기 때문이다(classifier.validate_skip_gate가 시작할 때 확인).
+# !!! 보정 전 임시 오프셋(+100 dB) 기준이라 이 dB 값 자체에는 의미가 없다. 소음계 보정 후 다시 확인 !!!
+SKIP_CLASSIFY_BELOW_DB: float = 24.0
+SKIP_MARGIN_DB: float = 10.0
+QUIET_TOP_LABEL: str = "(skipped: quiet)"
 
 # --- tools/classify_file.py ---
 # 두 카테고리에 같은 값을 적용해 비교해 볼 후보값들 (config 조합은 항상 함께 출력).

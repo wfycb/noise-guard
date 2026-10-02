@@ -50,22 +50,55 @@ def select_torch_device() -> torch.device:
     return torch.device("cpu")
 
 
+def judgment_limits_db() -> list[float]:
+    """판단 기준값 전부 (주간·야간, Leq·Lmax). 게이트 검증에 쓴다."""
+    return [
+        config.IMPACT_LEQ_LIMIT_DAY_DB,
+        config.IMPACT_LEQ_LIMIT_NIGHT_DB,
+        config.IMPACT_LMAX_LIMIT_DAY_DB,
+        config.IMPACT_LMAX_LIMIT_NIGHT_DB,
+        config.AIRBORNE_LEQ_LIMIT_DAY_DB,
+        config.AIRBORNE_LEQ_LIMIT_NIGHT_DB,
+    ]
+
+
+def validate_skip_gate(
+    gate_db: float, margin_db: float, limits_db: list[float]
+) -> None:
+    """게이트가 (가장 낮은 판단 기준 − 마진) 이하인지 확인한다. 아니면 ValueError (순수 함수).
+
+    기준 근처 소리를 분류 없이 건너뛰면 그 프레임이 카테고리 Leq에서 빠져 R3/R4가 과소평가된다.
+    """
+    allowed_db = min(limits_db) - margin_db
+    if gate_db > allowed_db:
+        raise ValueError(
+            f"SKIP_CLASSIFY_BELOW_DB {gate_db} dB가 (가장 낮은 기준 {min(limits_db)} − "
+            f"마진 {margin_db}) = {allowed_db} dB보다 큽니다"
+        )
+
+
 class CedClassifier:
     """CED 모델 래퍼 (side effect: 생성 시 모델 다운로드/로딩)."""
 
-    def __init__(self, airborne_scope: AirborneScope = config.AIRBORNE_SCOPE) -> None:
+    def __init__(
+        self,
+        airborne_scope: AirborneScope = config.AIRBORNE_SCOPE,
+        model_size: str = config.CED_MODEL_SIZE,
+    ) -> None:
         from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 
+        if model_size not in config.CED_MODELS:
+            raise ValueError(
+                f"알 수 없는 모델 크기 {model_size!r} (가능: {list(config.CED_MODELS)})"
+            )
+        self.model_size = model_size
+        self.model_name, revision = config.CED_MODELS[model_size]
         self.device = select_torch_device()
         self._feature_extractor = AutoFeatureExtractor.from_pretrained(
-            config.CED_MODEL_NAME,
-            revision=config.CED_MODEL_REVISION,
-            trust_remote_code=True,
+            self.model_name, revision=revision, trust_remote_code=True
         )
         self._model = AutoModelForAudioClassification.from_pretrained(
-            config.CED_MODEL_NAME,
-            revision=config.CED_MODEL_REVISION,
-            trust_remote_code=True,
+            self.model_name, revision=revision, trust_remote_code=True
         )
         self._model.to(self.device)
         self._model.eval()

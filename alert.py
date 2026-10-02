@@ -156,6 +156,7 @@ class NetworkSink:
         self.sent_alerts = 0
         self.sent_statuses = 0
         self.dropped_messages = 0
+        self._initial_status_sent = False
 
     def source_position(self, frame: Frame) -> tuple[int, int]:
         """프레임 마지막 샘플이 들어 있는 대표 마이크 청크의 (mic_index, seq)."""
@@ -184,7 +185,20 @@ class NetworkSink:
         active_mics: int,
         total_mics: int,
     ) -> None:
-        """매 프레임 상태는 보내지 않는다(대역폭·Pi 화면 갱신 부담). 변화만 STATUS로 보낸다."""
+        """매 프레임 상태는 보내지 않는다(대역폭·Pi 화면 갱신 부담). 변화만 STATUS로 보낸다.
+
+        단, 세션의 첫 프레임에서는 초기 상태를 한 번 보낸다. 재접속한 Pi는 마이크 상태를
+        "확인 불가"로 두고 있으므로, 이상이 없으면 STATUS가 오지 않아 계속 모르는 상태로 남기 때문이다.
+        첫 프레임 시점에는 경고 기준(연속 빠짐)을 넘은 마이크가 있을 수 없으므로 빠진 마이크는 없다.
+        """
+        if self._initial_status_sent:
+            return
+        self._initial_status_sent = True
+        status = StatusMessage((), active_mics, total_mics, frame.timestamp)
+        if self._session.send(MessageType.STATUS, encode_status(status)):
+            self.sent_statuses += 1
+        else:
+            self.dropped_messages += 1
 
     def emit_mic_status(self, change: MicStatusChange) -> None:
         status = StatusMessage(

@@ -1,0 +1,15 @@
+[tool.pytest.ini_options]
+# 모듈이 프로젝트 루트에 평평하게 있으므로 루트를 import 경로에 넣는다.
+pythonpath = ["."]
+testpaths = ["tests"]
+# 시나리오 회귀 테스트(CED + ESC-50)는 느리므로 기본 실행에서 빼고 `pytest -m slow`로 돌린다.
+markers = ["slow: CED 모델과 ESC-50 클립이 필요한 느린 시나리오 회귀 테스트"]
+addopts = "-m 'not slow'"
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = [".venv", "data"]
+
+[tool.black]
+target-version = ["py311"]
+extend-exclude = "(\\.venv|data)"

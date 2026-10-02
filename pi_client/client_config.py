@@ -7,6 +7,13 @@ SERVER_PORT: int = 5000
 CLIENT_ID: str = "pi-1"
 CONNECT_TIMEOUT_SEC: float = 5.0
 HELLO_ACK_TIMEOUT_SEC: float = 5.0
+# 이 시간 동안 서버로부터 아무것도 못 받으면 끊긴 것으로 본다. 서버는 PING_INTERVAL_SEC마다 PING을 보낸다.
+PEER_TIMEOUT_SEC: float = 6.0
+# PEER_TIMEOUT_SEC의 1/3 이하여야 한다(protocol.validate_ping_interval이 확인).
+PING_INTERVAL_SEC: float = 2.0
+# 연결이 끊기거나 실패하면 이 간격부터 두 배씩 늘려 다시 시도한다(최대 RECONNECT_MAX_SEC).
+RECONNECT_INITIAL_SEC: float = 1.0
+RECONNECT_MAX_SEC: float = 30.0
 # 파일 재생이 끝난 뒤 서버가 남은 오디오를 처리하고 마지막 알림을 보낼 때까지 기다리는 상한.
 DRAIN_TIMEOUT_SEC: float = 300.0
 

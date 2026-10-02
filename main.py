@@ -238,7 +238,9 @@ class FrameProducer(threading.Thread):
                     source.exhausted for source in self._sources
                 ):
                     return
-                self._output_queue.put(TickWithoutFrame(timestamp))
+                # 분류 창이 차기 전 tick은 어떤 마이크도 프레임을 낼 수 없으므로 빠짐으로 세지 않는다.
+                if tick * hop_sec >= config.CLASSIFY_WINDOW_SEC:
+                    self._output_queue.put(TickWithoutFrame(timestamp))
                 continue
             lag_ms = self._lag_ms(tick, pacing_start)
             if lag_ms is not None:
@@ -382,7 +384,7 @@ class RunResult:
     overflow_count: int = 0
     # Ctrl+C로 끝났는지 (네트워크 모드에서 다음 연결을 기다릴지 결정)
     interrupted: bool = False
-    # 마이크별로 tick에서 빠진 횟수 (시작 직후 분류 창이 차기 전 tick 포함)
+    # 마이크별로 tick에서 빠진 횟수 (분류 창이 차기 전 tick은 제외)
     missing_ticks: dict[str, int] = field(default_factory=dict)
 
 
@@ -494,10 +496,21 @@ def serve_network(
     max_sessions에 도달하거나 Ctrl+C를 받으면 끝난다. 연결 대기 중 Ctrl+C는 호출자에게 전달된다.
     """
     session_results: list[SessionRunResult] = []
+    last_frame_timestamp: float | None = None
     while max_sessions is None or len(session_results) < max_sessions:
         session = server.next_session(timeout=config.SERVER_THREAD_POLL_SEC)
         if session is None:
             continue
+        # 판단 엔진은 시각이 앞으로만 간다고 가정한다. 재접속한 세션의 시작 시각이 이전 세션의
+        # 마지막 프레임보다 앞서면(고속 재생 등) 그 뒤로 옮긴다. 실시간이면 일어나지 않는다.
+        if last_frame_timestamp is not None and (
+            session.stream_start_time < last_frame_timestamp
+        ):
+            logging.getLogger(__name__).warning(
+                "세션 시작 시각을 이전 세션 뒤로 %.1f초 옮깁니다",
+                last_frame_timestamp - session.stream_start_time,
+            )
+            session.stream_start_time = last_frame_timestamp
         network_sink = NetworkSink(session, config.CLASSIFY_HOP_SEC)
         sinks: list[AlertSink] = (
             [network_sink] if notifier is None else [notifier, network_sink]
@@ -525,6 +538,8 @@ def serve_network(
             len(result.frames),
         )
         session_results.append(SessionRunResult(result, session, network_sink))
+        if result.frames:
+            last_frame_timestamp = result.frames[-1].timestamp
         if result.interrupted:
             break
     return session_results

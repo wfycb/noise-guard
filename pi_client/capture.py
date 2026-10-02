@@ -173,17 +173,36 @@ class ChunkQueue:
             return len(self._items)
 
 
+StallSpec = dict[str, list[tuple[float, float]]]  # 방 → [(시작 초, 길이 초), ...]
+
+
 class FileStream:
     """wav 여러 개를 마이크처럼 청크 단위로 내보낸다 (테스트용, side effect: 파일 읽기·스레드).
 
     실시간 속도로 내보내고, fast면 기다리지 않는다. 길이가 다른 파일은 가장 긴 파일까지 무음으로
     채운다. 서버가 모든 마이크의 tick이 찰 때까지 기다리기 때문이다.
+
+    stalls: 지정한 방·구간의 청크를 보내지 않고 버린다(seq는 계속 증가). 실제 마이크가 멈춘
+    상황을 흉내 내 서버의 마이크 이상 표시를 확인하기 위한 것이다.
+
+    파일 위치(청크 번호)와 프로토콜 seq를 분리한다. 재접속하면 seq만 0부터 다시 세고 파일은 이어서
+    재생한다.
     """
 
-    def __init__(self, files: dict[str, Path], chunk_samples: int, fast: bool) -> None:
+    def __init__(
+        self,
+        files: dict[str, Path],
+        chunk_samples: int,
+        fast: bool,
+        stalls: StallSpec | None = None,
+    ) -> None:
         self._chunk_samples = chunk_samples
         self._fast = fast
         self._audio = {room: read_wav_int16(path) for room, path in files.items()}
+        unknown_rooms = set(stalls or {}) - set(self._audio)
+        if unknown_rooms:
+            raise ValueError(f"--stall에 없는 방: {sorted(unknown_rooms)}")
+        self._stalls = [list((stalls or {}).get(room, [])) for room in self._audio]
         for room, audio in self._audio.items():
             if audio.clipped_samples:
                 logger.warning(
@@ -198,6 +217,14 @@ class FileStream:
                 audio.sample_rate,
                 len(audio.samples) / audio.sample_rate,
             )
+        for room, intervals in (stalls or {}).items():
+            for stall_start, stall_length in intervals:
+                logger.info(
+                    "%s: %.1f초부터 %.1f초 동안 전송 중단(--stall)",
+                    room,
+                    stall_start,
+                    stall_length,
+                )
         longest_sec = max(
             len(audio.samples) / audio.sample_rate for audio in self._audio.values()
         )
@@ -205,6 +232,10 @@ class FileStream:
             int(numpy.ceil(longest_sec * audio.sample_rate / chunk_samples))
             for audio in self._audio.values()
         ]
+        self._next_chunk = [0] * len(self._audio)
+        self._seq_base = [0] * len(self._audio)
+        self._lock = threading.Lock()
+        self.stalled_chunks = 0
         self.finished = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -233,9 +264,14 @@ class FileStream:
         if self._thread is not None:
             self._thread.join(client_config.THREAD_JOIN_TIMEOUT_SEC)
 
-    def _chunk(self, mic_index: int, seq: int) -> numpy.ndarray:
+    def reset_sequence(self) -> None:
+        """재접속: 다음 청크부터 seq를 0으로 센다. 파일 재생 위치는 유지한다."""
+        with self._lock:
+            self._seq_base = list(self._next_chunk)
+
+    def _chunk(self, mic_index: int, chunk_index: int) -> numpy.ndarray:
         samples = list(self._audio.values())[mic_index].samples
-        start = seq * self._chunk_samples
+        start = chunk_index * self._chunk_samples
         chunk = samples[start : start + self._chunk_samples]
         if len(chunk) < self._chunk_samples:
             chunk = numpy.concatenate(
@@ -243,42 +279,74 @@ class FileStream:
             )
         return chunk
 
+    def _is_stalled(self, mic_index: int, chunk_start_sec: float) -> bool:
+        return any(
+            stall_start <= chunk_start_sec < stall_start + stall_length
+            for stall_start, stall_length in self._stalls[mic_index]
+        )
+
     def _run(self, chunk_queue: ChunkQueue, stop_event: threading.Event) -> None:
         sample_rates = [audio.sample_rate for audio in self._audio.values()]
-        next_seq = [0] * len(sample_rates)
         start_time = time.monotonic()
         try:
             while not stop_event.is_set():
-                pending = [
-                    index
-                    for index, count in enumerate(self._chunk_counts)
-                    if next_seq[index] < count
-                ]
-                if not pending:
-                    return
-                # 마이크마다 청크 길이(초)가 다를 수 있으므로, 청크 끝 시각이 가장 이른 것부터 보낸다.
-                mic_index = min(
-                    pending,
-                    key=lambda index: (next_seq[index] + 1) / sample_rates[index],
-                )
-                seq = next_seq[mic_index]
-                due = (
-                    start_time
-                    + (seq + 1) * self._chunk_samples / sample_rates[mic_index]
-                )
+                with self._lock:
+                    pending = [
+                        index
+                        for index, count in enumerate(self._chunk_counts)
+                        if self._next_chunk[index] < count
+                    ]
+                    if not pending:
+                        return
+                    # 마이크마다 청크 길이(초)가 다를 수 있으므로, 청크 끝 시각이 가장 이른 것부터.
+                    mic_index = min(
+                        pending,
+                        key=lambda index: (self._next_chunk[index] + 1)
+                        / sample_rates[index],
+                    )
+                    chunk_index = self._next_chunk[mic_index]
+                chunk_sec = self._chunk_samples / sample_rates[mic_index]
+                due = start_time + (chunk_index + 1) * chunk_sec
                 if not self._fast and stop_event.wait(max(0.0, due - time.monotonic())):
                     return
+                with self._lock:
+                    seq = chunk_index - self._seq_base[mic_index]
+                    self._next_chunk[mic_index] += 1
+                if self._is_stalled(mic_index, chunk_index * chunk_sec):
+                    self.stalled_chunks += 1
+                    continue
                 item = AudioChunkItem(
-                    mic_index, seq, 0, self._chunk(mic_index, seq), time.perf_counter()
+                    mic_index,
+                    seq,
+                    0,
+                    self._chunk(mic_index, chunk_index),
+                    time.perf_counter(),
                 )
                 if self._fast:
                     if not chunk_queue.put_blocking(item, stop_event):
                         return
                 else:
                     chunk_queue.put_drop_oldest(item)
-                next_seq[mic_index] += 1
         finally:
             self.finished.set()
+
+
+def parse_stall_spec(text: str) -> StallSpec:
+    """ "안방=10:5,서재=20:3" → {"안방": [(10.0, 5.0)], "서재": [(20.0, 3.0)]}. 같은 방 여러 번 가능."""
+    stalls: StallSpec = {}
+    for item in text.split(","):
+        room, separator, interval = item.partition("=")
+        start_text, colon, length_text = interval.partition(":")
+        try:
+            if not separator or not colon or not room.strip():
+                raise ValueError
+            stall_start, stall_length = float(start_text), float(length_text)
+            if stall_start < 0 or stall_length <= 0:
+                raise ValueError
+        except ValueError as error:
+            raise ValueError(f"'방=시작초:길이초' 형식이 아닙니다: {item!r}") from error
+        stalls.setdefault(room.strip(), []).append((stall_start, stall_length))
+    return stalls
 
 
 class MicStream:
@@ -299,6 +367,7 @@ class MicStream:
         self._chunk_samples = chunk_samples
         self._streams: list[object] = []
         self._next_seq = [0] * len(devices)
+        self._seq_lock = threading.Lock()
         self._overflow_counts = [0] * len(devices)
         self.finished = threading.Event()  # 마이크는 끝나지 않는다.
 
@@ -341,8 +410,9 @@ class MicStream:
                 self._overflow_counts[mic_index] += 1
                 flags |= FLAG_OVERFLOW
             # seq는 큐에서 버려지는 청크까지 포함해 증가시킨다. 서버가 빈 구간을 알 수 있게 하기 위해서다.
-            seq = self._next_seq[mic_index]
-            self._next_seq[mic_index] += 1
+            with self._seq_lock:
+                seq = self._next_seq[mic_index]
+                self._next_seq[mic_index] += 1
             chunk_queue.put_drop_oldest(
                 AudioChunkItem(
                     mic_index, seq, flags, input_data[:, 0].copy(), time.perf_counter()
@@ -353,7 +423,8 @@ class MicStream:
 
     def reset_sequence(self) -> None:
         """재접속하면 새 스트림이므로 seq를 0부터 다시 센다."""
-        self._next_seq = [0] * len(self._devices)
+        with self._seq_lock:
+            self._next_seq = [0] * len(self._devices)
 
     def stop(self) -> None:
         """스트림을 닫는다 (side effect: 장치 해제)."""

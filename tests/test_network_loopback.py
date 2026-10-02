@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -35,6 +36,7 @@ from protocol import (
     AudioChunk,
     ConnectionClosed,
     Hello,
+    HelloAck,
     Message,
     MessageType,
     MicInfo,
@@ -43,6 +45,7 @@ from protocol import (
     encode_alert,
     encode_audio,
     encode_hello,
+    encode_hello_ack,
     read_message,
     send_message,
 )
@@ -305,8 +308,8 @@ def test_one_mic_delayed_is_excluded_and_others_continue(server: AudioServer) ->
     ]
     assert [status.missing_mics for status in statuses] == [("안방",)]
     assert (statuses[0].active_mics, statuses[0].total_mics) == (1, 2)
-    # tick 1은 분류 창이 아직 안 차서 두 마이크 모두 빠진 것으로 센다.
-    assert result.missing_ticks == {"거실": 1, "안방": 5}
+    # tick 1은 분류 창이 차기 전이라 집계하지 않는다. 안방은 tick 2~5에서 빠졌다.
+    assert result.missing_ticks == {"거실": 0, "안방": 4}
 
 
 def test_all_mics_delayed_catch_up_without_loss(server: AudioServer) -> None:
@@ -648,3 +651,211 @@ def test_pi_client_shows_alerts_keeps_sending_and_measures_latency(
     assert all(
         0.0 <= latency < 3000.0 for latency in client.latencies_ms
     ), client.latencies_ms
+
+
+def test_no_missing_mics_reported_at_startup(server: AudioServer) -> None:
+    signals = [make_signal(5.0, [], 0.0), make_signal(5.0, [], 0.0)]
+    result, _, received = run_raw(server, ["거실", "안방"], signals, delay_for=None)
+    assert result.missing_ticks == {"거실": 0, "안방": 0}
+    assert not [m for m in received if m.message_type == MessageType.STATUS]
+
+
+# --- N4: 마이크 멈춤(--stall), 재접속, 타임아웃 ---
+
+
+def test_stalled_mic_shows_status_then_recovers(
+    server: AudioServer, tmp_path: Path
+) -> None:
+    paths = {}
+    for room in ("거실", "안방"):
+        paths[room] = tmp_path / f"{room}.wav"
+        wavfile.write(paths[room], SAMPLE_RATE, make_signal(11.0, [], 0.0))
+    run = start_serving(
+        server,
+        LevelStubClassifier(),
+        NoiseDecisionEngine(DecisionConfig.from_config(demo_mode=True)),
+    )
+    client = PiClient(
+        LOOPBACK_HOST,
+        server.address[1],
+        "pi-test",
+        FileStream(paths, CHUNK_SAMPLES, fast=False, stalls={"안방": [(2.0, 6.0)]}),
+        CHUNK_SAMPLES,
+        output=TimedRecordingOutput(),
+    )
+    client.run()
+    result = finish(run)[0].result
+    # 6초 멈춤 중 마감(2초) 안에 무음 채움이 도착하지 못한 tick만 빠짐으로 센다(약 6 - 2 = 4개).
+    assert [status.missing_mics for status in client.received_statuses] == [
+        ("안방",),
+        (),
+    ]
+    assert result.missing_ticks["거실"] == 0
+    assert 3 <= result.missing_ticks["안방"] <= 5
+
+
+def test_client_reconnects_after_server_drops_session(
+    server: AudioServer, tmp_path: Path
+) -> None:
+    path = tmp_path / "room.wav"
+    wavfile.write(path, SAMPLE_RATE, make_signal(6.0, [], 0.0))
+    run = start_serving(
+        server,
+        LevelStubClassifier(),
+        NoiseDecisionEngine(DecisionConfig.from_config(demo_mode=True)),
+        sessions=2,
+    )
+    client = PiClient(
+        LOOPBACK_HOST,
+        server.address[1],
+        "pi-test",
+        FileStream({"거실": path}, CHUNK_SAMPLES, fast=False),
+        CHUNK_SAMPLES,
+        output=TimedRecordingOutput(),
+        reconnect=True,
+        reconnect_initial_sec=0.2,
+    )
+
+    def drop_first_session() -> None:
+        deadline = time.monotonic() + 10.0
+        while server.active_session is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(2.0)
+        server.active_session.close("테스트: 서버가 세션을 끊음")
+
+    dropper = threading.Thread(target=drop_first_session, name="test-dropper")
+    dropper.start()
+    client.run()
+    dropper.join()
+    session_results = finish(run)
+    assert client.connections == 2
+    assert "서버가 연결을 닫음" in client.lost_reasons[0]
+    assert len(session_results) == 2
+    assert session_results[0].session.close_reason == "테스트: 서버가 세션을 끊음"
+    assert session_results[1].result.frames, "재접속한 세션도 프레임을 만들어야 합니다"
+
+
+def test_decision_state_survives_reconnect(server: AudioServer) -> None:
+    run = start_serving(
+        server,
+        LevelStubClassifier(),
+        NoiseDecisionEngine(DecisionConfig.from_config(demo_mode=True)),
+        sessions=2,
+    )
+    # 첫 연결: 충격 이벤트 2개(R1 1, 2회). 두 번째 연결: 1개 → 카운트 3회가 되어 R2 경고.
+    for signal in (
+        make_signal(10.0, [1.5, 6.0], 0.5),
+        make_signal(5.0, [1.5], 0.5),
+    ):
+        client = RawClient(server.address[1], ["거실"])
+        assert client.ack.accepted, client.ack.reasons
+        for seq, chunk in enumerate(chunks_of(signal)):
+            client.send_chunk(0, seq, chunk)
+        client.finish()
+    first, second = finish(run)
+    assert [a.count for a in first.result.alerts if a.rule == "R1"] == [1, 2]
+    second_r1 = [a for a in second.result.alerts if a.rule == "R1"]
+    second_r2 = [a for a in second.result.alerts if a.rule == "R2"]
+    assert [alert.count for alert in second_r1] == [3]
+    assert len(second_r2) == 1 and second_r2[0].room_counts == {"거실": 3}
+    assert second.result.frames[0].timestamp > first.result.frames[-1].timestamp
+
+
+def test_server_survives_client_reset_and_accepts_next(server: AudioServer) -> None:
+    run = start_serving(
+        server,
+        LevelStubClassifier(),
+        NoiseDecisionEngine(DecisionConfig.from_config(demo_mode=True)),
+        sessions=2,
+    )
+    first = RawClient(server.address[1], ["거실"])
+    for seq, chunk in enumerate(chunks_of(make_signal(3.0, [], 0.0))):
+        first.send_chunk(0, seq, chunk)
+    # 프로세스가 강제 종료된 것처럼 FIN 대신 RST로 끊는다.
+    first.connection.setsockopt(
+        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+    )
+    first.connection.close()
+    deadline = time.monotonic() + 10.0
+    while server.active_session is not None and server.active_session.connected:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    second = RawClient(server.address[1], ["거실"])
+    assert second.ack.accepted, second.ack.reasons
+    for seq, chunk in enumerate(chunks_of(make_signal(3.0, [], 0.0))):
+        second.send_chunk(0, seq, chunk)
+    second.finish()
+    session_results = finish(run)
+    assert "소켓 오류" in session_results[0].session.close_reason
+    assert len(session_results[1].result.frames) == 2
+
+
+def test_server_closes_client_that_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch, no_leftover_threads: None
+) -> None:
+    monkeypatch.setattr(config, "PEER_TIMEOUT_SEC", 0.9)
+    monkeypatch.setattr(config, "PING_INTERVAL_SEC", 0.3)
+    quiet_server = AudioServer(LOOPBACK_HOST, 0, start_time=DAY_START)
+    quiet_server.start()
+    try:
+        run = start_serving(
+            quiet_server,
+            LevelStubClassifier(),
+            NoiseDecisionEngine(DecisionConfig.from_config(demo_mode=True)),
+        )
+        client = RawClient(quiet_server.address[1], ["거실"])
+        received = []
+        try:
+            while True:
+                received.append(read_message(client.connection).message_type)
+        except (ConnectionClosed, OSError):
+            pass
+        client.connection.close()
+        session = finish(run)[0].session
+    finally:
+        quiet_server.close()
+    assert "수신 없음" in session.close_reason
+    assert MessageType.PING in received  # 서버는 그동안 PING을 보냈다
+
+
+def test_client_detects_server_that_goes_silent(
+    tmp_path: Path, no_leftover_threads: None
+) -> None:
+    listener = socket.create_server((LOOPBACK_HOST, 0))
+    accepted: list[socket.socket] = []
+
+    def silent_server() -> None:
+        connection, _ = listener.accept()
+        accepted.append(connection)
+        read_message(connection)  # HELLO
+        send_message(
+            connection,
+            MessageType.HELLO_ACK,
+            encode_hello_ack(HelloAck(True, (), time.time())),
+        )
+        # 이후로는 아무것도 보내지 않는다(PING도 없음).
+
+    server_thread = threading.Thread(target=silent_server, name="test-silent-server")
+    server_thread.start()
+    path = tmp_path / "room.wav"
+    wavfile.write(path, SAMPLE_RATE, make_signal(5.0, [], 0.0))
+    client = PiClient(
+        LOOPBACK_HOST,
+        listener.getsockname()[1],
+        "pi-test",
+        FileStream({"거실": path}, CHUNK_SAMPLES, fast=False),
+        CHUNK_SAMPLES,
+        output=TimedRecordingOutput(),
+        ping_interval_sec=0.3,
+        peer_timeout_sec=0.9,
+    )
+    started = time.monotonic()
+    exit_code = client.run()
+    elapsed = time.monotonic() - started
+    server_thread.join(5.0)
+    for connection in accepted:
+        connection.close()
+    listener.close()
+    assert exit_code != 0
+    assert "수신 없음" in client.lost_reasons[0]
+    assert elapsed < 3.0

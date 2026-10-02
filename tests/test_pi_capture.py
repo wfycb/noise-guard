@@ -15,7 +15,9 @@ from pi_client.capture import (
     WAVE_FORMAT_PCM,
     AudioChunkItem,
     ChunkQueue,
+    FileStream,
     UnsupportedWavError,
+    parse_stall_spec,
     parse_wav,
     read_wav_int16,
 )
@@ -191,3 +193,64 @@ def test_blocking_put_waits_for_space() -> None:
     assert not putter.is_alive()
     assert chunk_queue.get(1.0).seq == 1
     assert chunk_queue.dropped_chunks == 0
+
+
+# --- FileStream --stall, seq 재설정 ---
+
+
+def test_parse_stall_spec_supports_multiple_entries() -> None:
+    assert parse_stall_spec("안방=10:5,서재=20:3,안방=40:2") == {
+        "안방": [(10.0, 5.0), (40.0, 2.0)],
+        "서재": [(20.0, 3.0)],
+    }
+
+
+@pytest.mark.parametrize("text", ["안방", "안방=10", "안방=a:5", "안방=10:0", "=1:2"])
+def test_parse_stall_spec_rejects_bad_text(text: str) -> None:
+    with pytest.raises(ValueError):
+        parse_stall_spec(text)
+
+
+def drain(chunk_queue: ChunkQueue) -> list[AudioChunkItem]:
+    items = []
+    while (item := chunk_queue.get(0.0)) is not None:
+        items.append(item)
+    return items
+
+
+def test_stall_drops_chunks_but_seq_keeps_counting(tmp_path: Path) -> None:
+    path = tmp_path / "room.wav"
+    wavfile.write(path, SAMPLE_RATE, numpy.ones(SAMPLE_RATE * 2, numpy.int16))
+    stream = FileStream({"안방": path}, 4800, fast=True, stalls={"안방": [(0.5, 0.5)]})
+    chunk_queue = ChunkQueue(max_chunks=100)
+    stream.start(chunk_queue, threading.Event())
+    stream.stop()
+    seqs = [item.seq for item in drain(chunk_queue)]
+    # 100ms 청크 20개 중 0.5~1.0초 구간(seq 5~9)만 빠진다.
+    assert seqs == [0, 1, 2, 3, 4] + list(range(10, 20))
+    assert stream.stalled_chunks == 5
+
+
+def test_stall_for_unknown_room_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "room.wav"
+    wavfile.write(path, SAMPLE_RATE, numpy.zeros(4800, numpy.int16))
+    with pytest.raises(ValueError, match="서재"):
+        FileStream({"안방": path}, 4800, fast=True, stalls={"서재": [(1.0, 1.0)]})
+
+
+def test_reset_sequence_restarts_seq_but_not_file_position(tmp_path: Path) -> None:
+    path = tmp_path / "room.wav"
+    samples = numpy.arange(4800 * 6, dtype=numpy.int16)
+    wavfile.write(path, SAMPLE_RATE, samples)
+    # 실시간 재생(100ms마다 1청크)이라 재설정 시점 이후의 청크는 아직 만들어지지 않았다.
+    stream = FileStream({"안방": path}, 4800, fast=False)
+    chunk_queue = ChunkQueue(max_chunks=10)
+    stream.start(chunk_queue, threading.Event())
+    first = [chunk_queue.get(1.0), chunk_queue.get(1.0)]
+    stream.reset_sequence()
+    stream.stop()
+    rest = drain(chunk_queue)
+    assert [item.seq for item in first] == [0, 1]
+    assert [item.seq for item in rest] == [0, 1, 2, 3]
+    starts = [int(item.samples[0]) for item in first + rest]
+    assert starts == [0, 4800, 9600, 14400, 19200, 24000]

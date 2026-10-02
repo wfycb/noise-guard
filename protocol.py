@@ -29,6 +29,9 @@ MIN_CHUNK_SAMPLES = 160
 MAX_CHUNK_SAMPLES = 65535
 MAX_MIC_INDEX = 255  # AUDIO 헤더 mic_index가 uint8
 
+# 수신 타임아웃 안에 PING이 최소 이만큼 오가야 일시적인 지연을 끊김으로 오판하지 않는다.
+PING_TIMEOUT_RATIO = 3
+
 LENGTH_PREFIX = struct.Struct(">I")
 TYPE_BYTE = struct.Struct("B")
 # (mic_index uint8, seq uint32, flags uint32, sample_count uint16), little-endian, 패딩 없음.
@@ -397,3 +400,15 @@ def decode_status(body: bytes) -> StatusMessage:
         )
     except (KeyError, TypeError, ValueError) as error:
         raise PayloadError(f"STATUS 형식이 틀립니다: {error}") from error
+
+
+def validate_ping_interval(ping_interval_sec: float, peer_timeout_sec: float) -> None:
+    """PING 간격이 수신 타임아웃의 1/PING_TIMEOUT_RATIO 이하인지 확인한다. 아니면 ValueError."""
+    if (
+        ping_interval_sec <= 0
+        or ping_interval_sec * PING_TIMEOUT_RATIO > peer_timeout_sec
+    ):
+        raise ValueError(
+            f"PING 간격 {ping_interval_sec}초는 수신 타임아웃 {peer_timeout_sec}초의 "
+            f"1/{PING_TIMEOUT_RATIO} 이하여야 합니다"
+        )

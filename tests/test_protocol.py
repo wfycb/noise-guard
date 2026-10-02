@@ -38,6 +38,7 @@ from protocol import (
     read_message,
     recv_exact,
     validate_hello,
+    validate_ping_interval,
 )
 
 
@@ -413,3 +414,17 @@ def test_status_survives_framing() -> None:
 def test_bad_status_is_payload_error(body: bytes) -> None:
     with pytest.raises(PayloadError):
         decode_status(body)
+
+
+# --- PING 간격 ---
+
+
+def test_ping_interval_within_one_third_is_valid() -> None:
+    validate_ping_interval(2.0, 6.0)
+    validate_ping_interval(1.0, 6.0)
+
+
+@pytest.mark.parametrize("interval, timeout", [(2.1, 6.0), (3.0, 6.0), (0.0, 6.0)])
+def test_ping_interval_too_long_is_rejected(interval: float, timeout: float) -> None:
+    with pytest.raises(ValueError, match="1/3"):
+        validate_ping_interval(interval, timeout)

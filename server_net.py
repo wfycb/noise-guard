@@ -31,6 +31,7 @@ from protocol import (
     read_message,
     send_message,
     validate_hello,
+    validate_ping_interval,
 )
 
 logger = logging.getLogger(__name__)
@@ -157,7 +158,11 @@ class ClientSession:
 
     def _send_loop(self) -> None:
         while True:
-            item = self._send_queue.get()
+            try:
+                item = self._send_queue.get(timeout=config.PING_INTERVAL_SEC)
+            except queue.Empty:
+                # 보낼 것이 없어도 PING을 보내 Pi가 연결 상태를 알 수 있게 한다.
+                item = (MessageType.PING, b"")
             if item is None:
                 return
             message_type, body = item
@@ -198,6 +203,7 @@ class AudioServer:
     """접속을 받아 HELLO를 검증하고 ClientSession을 넘겨준다. 동시에 클라이언트 하나만 받는다."""
 
     def __init__(self, host: str, port: int, start_time: float | None = None) -> None:
+        validate_ping_interval(config.PING_INTERVAL_SEC, config.PEER_TIMEOUT_SEC)
         self._listener = socket.create_server((host, port))
         self._listener.settimeout(config.SERVER_THREAD_POLL_SEC)
         self.address: tuple[str, int] = self._listener.getsockname()[:2]
@@ -217,6 +223,11 @@ class AudioServer:
         """접속 대기 스레드를 시작한다 (side effect: 스레드)."""
         self._accept_thread.start()
         logger.info("서버 대기 중 %s:%d", *self.address)
+
+    @property
+    def active_session(self) -> ClientSession | None:
+        with self._lock:
+            return self._active
 
     def next_session(self, timeout: float) -> ClientSession | None:
         try:

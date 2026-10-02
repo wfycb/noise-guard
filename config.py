@@ -119,6 +119,9 @@ SERVER_PORT: int = 5000
 HELLO_TIMEOUT_SEC: float = 5.0
 # 이 시간 동안 아무 메시지도 받지 못하면 끊긴 것으로 본다. 오디오가 계속 오므로 정상 연결에서는 걸리지 않는다.
 PEER_TIMEOUT_SEC: float = 6.0
+# 서버도 이 간격으로 PING을 보낸다. 알림이 드물어도 Pi가 끊김을 감지할 수 있게 하기 위해서다.
+# PEER_TIMEOUT_SEC의 1/3 이하여야 한다(protocol.validate_ping_interval이 확인).
+PING_INTERVAL_SEC: float = 2.0
 # 다른 마이크는 tick 분량이 도착했는데 한 마이크만 이 시간 넘게 늦으면, 그 tick에서 그 마이크를 뺀다.
 MIC_STALL_TIMEOUT_SEC: float = 2.0
 # 도착했지만 아직 처리하지 못한 오디오의 마이크별 최대 길이. 넘으면 서버가 너무 밀린 것이라 연결을 끊는다.

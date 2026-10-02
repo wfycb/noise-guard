@@ -74,6 +74,22 @@ def spread_warning(readings: list[LevelReading], max_spread_db: float) -> str | 
     )
 
 
+def signal_to_background_warning(
+    program_leq: float, background_leq: float, min_snr_db: float
+) -> str | None:
+    """보정 신호(핑크노이즈)가 배경보다 min_snr_db 이상 크지 않으면 경고 문장 (순수 함수).
+
+    두 값은 같은 단위(dBFS(A))여야 한다. 신호가 작으면 배경 소음이 섞여 오프셋이 커지는 쪽으로 틀어진다.
+    """
+    margin_db = program_leq - background_leq
+    if margin_db >= min_snr_db:
+        return None
+    return (
+        f"보정 신호가 배경 소음에 비해 작음({margin_db:.1f} dB < {min_snr_db} dB), "
+        "볼륨을 올리세요"
+    )
+
+
 def evaluate_background(
     background_leq_db: float,
     gate_db: float,

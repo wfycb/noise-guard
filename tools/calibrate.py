@@ -11,6 +11,7 @@ level.LevelMeter(마이크 원래 샘플레이트에서 A특성, 125ms 블록, �
     4. CALIBRATION_MEASURE_SEC 동안 프로그램 Leq를 잰다.
     5. 같은 시간의 소음계 값을 입력한다.
     6. offset = 소음계 Leq − 프로그램 Leq.
+    프로그램 Leq − 배경 Leq가 CALIBRATION_MIN_SNR_DB(10 dB)보다 작으면 경고하고 그 단계를 다시 잴지 묻는다.
     --levels N이면 볼륨을 바꿔 4~6을 N번 하고, 오프셋 차이가 CALIBRATION_MAX_SPREAD_DB를 넘으면 경고한다.
 
 실행 (프로젝트 루트에서):
@@ -38,6 +39,7 @@ from calibration import (
     evaluate_background,
     make_reading,
     save_mic_calibration,
+    signal_to_background_warning,
     spread_warning,
 )
 from capture import AudioSource
@@ -108,6 +110,29 @@ def parse_meter_value(text: str) -> float:
     return value
 
 
+YES_ANSWERS = ("", "y", "yes", "예", "네", "ㅇ")
+NO_ANSWERS = ("n", "no", "아니오", "아니요", "ㄴ")
+
+
+def parse_yes_no(text: str) -> bool:
+    """Y/n 답. 빈 입력은 예(기본값). 알 수 없는 답은 ValueError (순수 함수)."""
+    answer = text.strip().lower()
+    if answer in YES_ANSWERS:
+        return True
+    if answer in NO_ANSWERS:
+        return False
+    raise ValueError(f"'{text}'는 예/아니오로 알아들을 수 없습니다")
+
+
+def ask_yes_no(prompt: str, read_line: Callable[[str], str] = input) -> bool:
+    """예/아니오를 알아들을 때까지 다시 묻는다 (side effect: 콘솔 입력)."""
+    while True:
+        try:
+            return parse_yes_no(read_line(prompt))
+        except ValueError as error:
+            print(f"  다시 입력하세요: {error}")
+
+
 def ask_meter_value(prompt: str, read_line: Callable[[str], str] = input) -> float:
     """소음계 값을 숫자가 들어올 때까지 다시 묻는다 (side effect: 콘솔 입력)."""
     while True:
@@ -140,6 +165,19 @@ def run_calibration(
             "소음계도 함께 측정하세요 "
         )
         program_leq = monitor.measure(room, duration_sec)
+        while (
+            warning := signal_to_background_warning(
+                program_leq, background_dbfs_a, config.CALIBRATION_MIN_SNR_DB
+            )
+        ) is not None:
+            print(f"[경고] {warning}")
+            if not ask_yes_no("    이 단계를 다시 측정할까요? [Y/n] ", read_line):
+                break
+            read_line(
+                f"    볼륨을 올리고 Enter를 누르면 {duration_sec:g}초 동안 다시 잽니다 "
+                "(소음계도 새로 측정) "
+            )
+            program_leq = monitor.measure(room, duration_sec)
         meter_leq = ask_meter_value(
             f"    프로그램 {program_leq:.1f} dBFS(A). 같은 시간의 소음계 Leq(dB(A)): ",
             read_line,

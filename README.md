@@ -375,6 +375,9 @@ R1은 `lmax_db`(125ms 블록 최댓값)를, R3는 `leq_db`(1초 에너지 평균
 1. 소음계 값을 입력하면 `offset = 소음계 Leq − 프로그램 Leq`를 계산합니다.
 1. `--levels 3`이면 볼륨을 바꿔 4~5를 세 번 하고, 오프셋 차이가 `CALIBRATION_MAX_SPREAD_DB`(2 dB)를 넘으면
    경고합니다. 마이크 AGC(자동 이득)가 켜져 있으면 이 차이가 커집니다.
+1. 단계마다 핑크노이즈 Leq가 배경 Leq보다 `CALIBRATION_MIN_SNR_DB`(10 dB) 이상 크지 않으면
+   "보정 신호가 배경 소음에 비해 작음, 볼륨을 올리세요"라고 경고하고, 그 단계를 다시 잴지 묻습니다.
+   신호가 작으면 배경 소음이 섞여 오프셋이 틀어지기 때문입니다.
 
 ```powershell
 # 노트북에 꽂은 마이크 (장치 번호는 tools.list_devices로 확인)
@@ -386,6 +389,12 @@ R1은 `lmax_db`(125ms 블록 최댓값)를, R3는 `leq_db`(1초 에너지 평균
 
 결과는 `calibration.json`에 방 이름별로 저장됩니다(`offset_db`, `meter_leq`, `program_leq`, `levels`,
 `background_leq_db`, `sample_rate`, `device`, `measured_at`). 다른 방의 결과는 그대로 둡니다.
+형식은 [calibration.example.json](calibration.example.json)에 있습니다(숫자는 모두 예시값).
+
+- **보정값은 마이크 장비와 설치 위치마다 다른 값이라 git에 넣지 않습니다**(`.gitignore`에 등록).
+  팀원과 공유하려면 `calibration.json` 파일을 직접 전달하세요. 마이크나 위치를 바꾸면 다시 잽니다.
+- 테스트와 예시 생성은 프로젝트 루트에 `calibration.json`을 만들지 않습니다(테스트는 임시 폴더,
+  예시는 `data/` 아래). 테스트가 루트에 만들면 실패하도록 `tests/conftest.py`가 검사합니다.
 
 - 서버는 시작할 때 `calibration.json`(또는 `--calibration-file`)이 있으면 방별 오프셋을 씁니다.
 - 파일에 없는 방은 임시 오프셋 +100 dB를 쓰고, **시작 로그와 그 방의 모든 알림에 "보정 안 됨"을 표시**합니다

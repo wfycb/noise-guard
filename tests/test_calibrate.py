@@ -17,6 +17,7 @@ from calibration import (
     load_calibration,
     make_reading,
     save_mic_calibration,
+    signal_to_background_warning,
     spread_warning,
     warn_uncalibrated,
 )
@@ -26,6 +27,7 @@ from tools.calibrate import (
     LevelMonitor,
     ask_meter_value,
     parse_meter_value,
+    parse_yes_no,
     report_calibration,
     run_calibration,
 )
@@ -149,6 +151,13 @@ def test_saving_another_room_keeps_existing(tmp_path: Path) -> None:
     assert loaded["안방"].offset_db == pytest.approx(91.0)
 
 
+def test_example_file_loads_and_is_marked_as_example() -> None:
+    path = Path(__file__).resolve().parent.parent / "calibration.example.json"
+    loaded = load_calibration(path)
+    assert set(loaded) == {"거실"}
+    assert "예시값" in json.loads(path.read_text(encoding="utf-8"))["거실"]["_comment"]
+
+
 def test_missing_file_means_no_calibration(tmp_path: Path) -> None:
     assert load_calibration(tmp_path / "none.json") == {}
 
@@ -210,14 +219,9 @@ def test_ask_meter_value_retries_until_valid() -> None:
 
 
 def test_run_calibration_measures_with_level_meter(tmp_path: Path) -> None:
-    # 1kHz, 진폭 0.1 → 약 −23 dBFS(A). 소음계 70 → 오프셋 약 93.
-    time_axis = numpy.arange(6 * SAMPLE_RATE) / SAMPLE_RATE
+    # 배경 0~1초 진폭 0.01(약 −43 dBFS(A)), 핑크노이즈 대신 1kHz 진폭 0.1(약 −23). 소음계 70 → 오프셋 약 93.
     path = tmp_path / "tone.wav"
-    wavfile.write(
-        path,
-        SAMPLE_RATE,
-        (0.1 * numpy.sin(2 * numpy.pi * 1000 * time_axis)).astype(numpy.float32),
-    )
+    write_segments(path, [0.01, 0.1, 0.1, 0.1])
     source = FileSource("거실", path, end_behavior="stop")
     monitor = LevelMonitor([source], realtime_pacing=True)
     monitor.start()
@@ -231,4 +235,74 @@ def test_run_calibration_measures_with_level_meter(tmp_path: Path) -> None:
         monitor.join(5.0)
     assert calibration.program_leq == pytest.approx(-23.0, abs=0.3)
     assert calibration.offset_db == pytest.approx(93.0, abs=0.3)
-    assert calibration.background_leq_db == pytest.approx(70.0, abs=0.3)
+    assert calibration.background_leq_db == pytest.approx(50.0, abs=0.3)
+
+
+# --- 보정 신호 크기 ---
+
+
+def test_signal_well_above_background_is_fine() -> None:
+    assert signal_to_background_warning(-30.0, -45.0, min_snr_db=10.0) is None
+
+
+def test_signal_close_to_background_warns() -> None:
+    message = signal_to_background_warning(-38.0, -45.0, min_snr_db=10.0)
+    assert message is not None and "볼륨을 올리세요" in message and "7.0 dB" in message
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [("", True), ("Y", True), ("예", True), ("n", False), ("아니오", False)],
+)
+def test_parse_yes_no(text: str, expected: bool) -> None:
+    assert parse_yes_no(text) is expected
+
+
+def test_parse_yes_no_rejects_unknown() -> None:
+    with pytest.raises(ValueError):
+        parse_yes_no("글쎄")
+
+
+def write_segments(path: Path, amplitudes: list[float]) -> None:
+    """1초씩 1kHz 사인 진폭을 바꾼 wav."""
+    segment_time = numpy.arange(SAMPLE_RATE) / SAMPLE_RATE
+    tone = numpy.sin(2 * numpy.pi * 1000 * segment_time)
+    samples = numpy.concatenate([amplitude * tone for amplitude in amplitudes])
+    wavfile.write(path, SAMPLE_RATE, samples.astype(numpy.float32))
+
+
+def test_low_signal_step_can_be_measured_again(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    # 0~1초 배경(진폭 0.1, 약 −23), 1~2초 약한 신호(0.12, 배경보다 1.6 dB), 2~3초 충분한 신호(1.0, 약 −3).
+    path = tmp_path / "steps.wav"
+    write_segments(path, [0.1, 0.12, 1.0, 1.0])
+    monitor = LevelMonitor([FileSource("거실", path, "stop")], realtime_pacing=True)
+    monitor.start()
+    answers = iter(["", "", "y", "", "90"])
+    try:
+        calibration = run_calibration(
+            monitor, "거실", 1, 1.0, SAMPLE_RATE, "file", lambda _: next(answers)
+        )
+    finally:
+        monitor.stop_event.set()
+        monitor.join(5.0)
+    assert "볼륨을 올리세요" in capsys.readouterr().out
+    assert calibration.program_leq == pytest.approx(-3.0, abs=0.3)
+    assert calibration.offset_db == pytest.approx(93.0, abs=0.3)
+
+
+def test_low_signal_can_be_accepted_without_retry(tmp_path: Path) -> None:
+    path = tmp_path / "steps.wav"
+    write_segments(path, [0.1, 0.12, 0.12])
+    monitor = LevelMonitor([FileSource("거실", path, "stop")], realtime_pacing=True)
+    monitor.start()
+    answers = iter(["", "", "n", "60"])
+    try:
+        calibration = run_calibration(
+            monitor, "거실", 1, 1.0, SAMPLE_RATE, "file", lambda _: next(answers)
+        )
+    finally:
+        monitor.stop_event.set()
+        monitor.join(5.0)
+    assert calibration.program_leq == pytest.approx(-21.4, abs=0.3)

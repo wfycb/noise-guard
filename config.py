@@ -123,6 +123,8 @@ CALIBRATION_FILE: str = "calibration.json"
 CALIBRATION_MEASURE_SEC: float = 10.0
 # 볼륨을 바꿔 여러 번 잰 오프셋의 차이가 이보다 크면 경고한다(마이크 AGC가 켜져 있으면 커짐).
 CALIBRATION_MAX_SPREAD_DB: float = 2.0
+# 핑크노이즈 Leq가 배경 Leq보다 이만큼 이상 커야 한다. 작으면 배경 소음이 섞여 오프셋이 틀어진다.
+CALIBRATION_MIN_SNR_DB: float = 10.0
 # 배경 소음이 최저 판단 기준에서 이 값 이내면 오탐 위험으로 경고한다.
 CALIBRATION_BACKGROUND_NEAR_LIMIT_DB: float = 5.0
 # 권장 게이트 = min(배경 + 이 값, 최저 기준 − SKIP_MARGIN_DB). 배경 소음 프레임은 건너뛰되 여유를 둔다.

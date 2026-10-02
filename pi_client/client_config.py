@@ -23,6 +23,15 @@ MIC_DEVICES: dict[str, int | str] = {}
 SEND_QUEUE_MAX_CHUNKS: int = 200
 QUEUE_POLL_SEC: float = 0.2
 
+# --- 출력 (LED / 디스플레이) ---
+LED_BLINK_COUNT: int = 3  # caution: LED 점멸 횟수
+LED_BLINK_INTERVAL_SEC: float = 0.25
+DISPLAY_HOLD_SEC: float = 10.0  # warning: 디스플레이 표시 유지 시간
+
+# --- 종단 지연 측정 ---
+# ALERT의 source_seq로 캡처 시각을 찾기 위해 seq별 캡처 시각을 이 시간만큼 기억한다.
+LATENCY_HISTORY_SEC: float = 30.0
+
 # --- 스레드 ---
 THREAD_JOIN_TIMEOUT_SEC: float = 5.0
 THREAD_NAME_PREFIX: str = "noise-guard-pi"

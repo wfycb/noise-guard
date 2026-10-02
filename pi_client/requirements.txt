@@ -1,0 +1,5 @@
+# Pi 클라이언트 의존성 (Python 3.11, Raspberry Pi OS Bookworm 기준)
+# 노트북(Windows, Python 3.11.9)에서 동작 확인한 버전. Pi 실기기 확인은 남은 작업.
+# 시스템 패키지 libportaudio2가 필요하다: sudo apt install libportaudio2
+numpy==2.4.6
+sounddevice==0.5.6

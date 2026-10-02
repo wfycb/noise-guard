@@ -306,6 +306,9 @@ class _MicState:
 class NetworkStream:
     """연결 하나의 마이크들이 공유하는 수신 버퍼와 tick 결정 (스레드 안전).
 
+    도착 시각은 time.perf_counter()로 잰다. Windows의 time.monotonic()은 약 15.6ms 단위라
+    처리 지연(수십 ms) 측정에 거칠기 때문이다.
+
     시간축은 오디오 샘플 수다. seq × chunk_samples가 그 청크의 절대 위치이고, 빈 seq는 무음으로
     채운다. tick k는 마이크마다 [(k-1)·hop, k·hop) 구간을 소비한다.
 
@@ -375,7 +378,7 @@ class NetworkStream:
                 state.stats.gap_filled_chunks += gap // self.chunk_samples
                 self._append(state, numpy.zeros(gap, dtype=numpy.int16))
             self._append(state, samples)
-            self._record_boundary_arrivals(state, time.monotonic())
+            self._record_boundary_arrivals(state, time.perf_counter())
             backlog_sec = (state.inbound.end - state.inbound.start) / state.sample_rate
             self._condition.notify_all()
         if backlog_sec > self._backlog_max_sec:
@@ -423,7 +426,7 @@ class NetworkStream:
                     anchor = min(
                         self._mics[index].boundary_arrivals[tick] for index in ready
                     )
-                    remaining = anchor + self._stall_timeout_sec - time.monotonic()
+                    remaining = anchor + self._stall_timeout_sec - time.perf_counter()
                     if remaining <= 0:
                         self._record_decision(tick, ready)
                     else:
@@ -465,7 +468,7 @@ class NetworkStream:
             return None
 
     def tick_ready_time(self, tick: int) -> float | None:
-        """tick에 포함된 마이크의 데이터가 모두 도착한 time.monotonic() 시각."""
+        """tick에 포함된 마이크의 데이터가 모두 도착한 time.perf_counter() 시각."""
         with self._condition:
             return self._ready_times.get(tick)
 

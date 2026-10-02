@@ -35,9 +35,11 @@ from protocol import (
     AudioChunk,
     ConnectionClosed,
     Hello,
+    Message,
     MessageType,
     MicInfo,
     decode_hello_ack,
+    decode_status,
     encode_alert,
     encode_audio,
     encode_hello,
@@ -178,15 +180,17 @@ class RawClient:
         body = encode_audio(AudioChunk(mic_index, seq, 0, samples))
         send_message(self.connection, MessageType.AUDIO, body)
 
-    def finish(self) -> None:
-        """송신을 닫고 서버가 닫을 때까지 읽는다."""
+    def finish(self) -> list[Message]:
+        """송신을 닫고 서버가 닫을 때까지 읽는다. 받은 메시지(ALERT, STATUS 등)를 반환한다."""
         self.connection.shutdown(socket.SHUT_WR)
+        received = []
         try:
             while True:
-                read_message(self.connection)
+                received.append(read_message(self.connection))
         except (ConnectionClosed, OSError):
             pass
         self.connection.close()
+        return received
 
 
 def send_schedule(
@@ -212,8 +216,8 @@ def run_raw(
     signals: list[numpy.ndarray],
     delay_for: Callable[[int, int], float] | None,
     skip_seqs: set[int] = frozenset(),
-) -> tuple[RunResult, ClientSession]:
-    """delay_for가 None이면 지연 없이 한꺼번에 보낸다."""
+) -> tuple[RunResult, ClientSession, list[Message]]:
+    """delay_for가 None이면 지연 없이 한꺼번에 보낸다. 서버가 보낸 메시지도 함께 반환한다."""
     engine = NoiseDecisionEngine(DecisionConfig.from_config(demo_mode=True))
     run = start_serving(server, LevelStubClassifier(), engine)
     client = RawClient(server.address[1], rooms)
@@ -225,9 +229,9 @@ def run_raw(
                     client.send_chunk(mic, seq, chunk)
     else:
         send_schedule(client, signals, delay_for)
-    client.finish()
+    received = client.finish()
     session_result = finish(run)[0]
-    return session_result.result, session_result.session
+    return session_result.result, session_result.session, received
 
 
 def frame_rows(frames: list[Frame]) -> list[tuple]:
@@ -248,7 +252,7 @@ def frame_rows(frames: list[Frame]) -> list[tuple]:
 
 def test_frame_timestamps_follow_audio_samples(server: AudioServer) -> None:
     signal = make_signal(5.0, bursts=[2.5], amplitude=0.5)
-    result, session = run_raw(server, ["거실"], [signal], delay_for=None)
+    result, session, _ = run_raw(server, ["거실"], [signal], delay_for=None)
     offsets = [frame.timestamp - session.stream_start_time for frame in result.frames]
     # 분류 창(2초)이 찬 tick 2부터 5까지, 오디오 1초마다 정확히 1프레임.
     assert offsets == pytest.approx([2.0, 3.0, 4.0, 5.0])
@@ -259,7 +263,7 @@ def test_skipped_seq_is_filled_with_silence_without_shifting_time(
     server: AudioServer,
 ) -> None:
     signal = make_signal(5.0, bursts=[3.5], amplitude=0.5)
-    result, session = run_raw(
+    result, session, _ = run_raw(
         server, ["거실"], [signal], delay_for=None, skip_seqs={10, 11, 12}
     )
     assert session.stats()["거실"].gap_filled_chunks == 3
@@ -278,7 +282,7 @@ def test_one_mic_delayed_is_excluded_and_others_continue(server: AudioServer) ->
     quiet_room = make_signal(5.0, bursts=[2.2], amplitude=0.2)
     loud_room = make_signal(5.0, bursts=[2.2], amplitude=0.9)
     started = time.monotonic()
-    result, session = run_raw(
+    result, session, received = run_raw(
         server,
         ["거실", "안방"],
         [quiet_room, loud_room],
@@ -293,6 +297,16 @@ def test_one_mic_delayed_is_excluded_and_others_continue(server: AudioServer) ->
     assert stats["안방"].stalled_ticks == 5
     assert stats["안방"].late_discarded_samples == 5 * SAMPLE_RATE
     assert stats["거실"].stalled_ticks == 0
+    # 3 tick 연속으로 빠지면 Pi에 STATUS를 한 번 보낸다(상태가 바뀔 때만).
+    statuses = [
+        decode_status(message.body)
+        for message in received
+        if message.message_type == MessageType.STATUS
+    ]
+    assert [status.missing_mics for status in statuses] == [("안방",)]
+    assert (statuses[0].active_mics, statuses[0].total_mics) == (1, 2)
+    # tick 1은 분류 창이 아직 안 차서 두 마이크 모두 빠진 것으로 센다.
+    assert result.missing_ticks == {"거실": 1, "안방": 5}
 
 
 def test_all_mics_delayed_catch_up_without_loss(server: AudioServer) -> None:
@@ -300,14 +314,14 @@ def test_all_mics_delayed_catch_up_without_loss(server: AudioServer) -> None:
         make_signal(6.0, bursts=[1.2, 4.2], amplitude=0.3),
         make_signal(6.0, bursts=[2.2, 4.6], amplitude=0.6),
     ]
-    baseline, _ = run_raw(server, ["거실", "안방"], signals, delay_for=None)
+    baseline, _, _ = run_raw(server, ["거실", "안방"], signals, delay_for=None)
 
     # 2초 지점부터 모든 마이크가 3초 멈췄다가, 밀린 청크를 한꺼번에 보내고 실시간으로 이어간다.
     def pause_after_two_seconds(mic: int, seq: int) -> float:
         chunk_end = (seq + 1) * CHUNK_SEC
         return max(0.0, 5.0 - chunk_end) if chunk_end > 2.0 else 0.0
 
-    delayed, session = run_raw(
+    delayed, session, _ = run_raw(
         server, ["거실", "안방"], signals, delay_for=pause_after_two_seconds
     )
     stats = session.stats()
@@ -566,3 +580,71 @@ def test_network_path_matches_direct_file_path(
     assert [frame.mic_name for frame in network.frames] == [
         frame.mic_name for frame in direct.frames
     ]
+
+
+class TimedRecordingOutput:
+    """출력 시각과 그때까지 보낸 청크 수를 기록한다. 표시 유지 중 전송이 계속되는지 보기 위해서다."""
+
+    def __init__(self) -> None:
+        self.client: PiClient | None = None
+        self.events: list[tuple[str, float, int]] = []
+
+    def _record(self, kind: str) -> None:
+        sent = self.client.sent_chunks if self.client else 0
+        self.events.append((kind, time.monotonic(), sent))
+
+    def show_caution(self, alert: dict) -> None:
+        self._record("caution")
+
+    def show_warning(self, alert: dict) -> None:
+        self._record("warning")
+
+    def show_status(self, status: object) -> None:
+        self._record("status")
+
+    def clear(self) -> None:
+        self._record("clear")
+
+
+def test_pi_client_shows_alerts_keeps_sending_and_measures_latency(
+    server: AudioServer, tmp_path: Path
+) -> None:
+    # 4초 간격 버스트 3개: t≈2 warning(R1+R3), t≈6 caution(R1, R3는 쿨다운), t≈10 warning(R1+R2).
+    path = tmp_path / "room.wav"
+    wavfile.write(path, SAMPLE_RATE, make_signal(11.0, [1.5, 5.5, 9.5], 0.5))
+    run = start_serving(
+        server,
+        LevelStubClassifier(),
+        NoiseDecisionEngine(DecisionConfig.from_config(demo_mode=True)),
+    )
+    output = TimedRecordingOutput()
+    client = PiClient(
+        LOOPBACK_HOST,
+        server.address[1],
+        "pi-test",
+        FileStream({"거실": path}, CHUNK_SAMPLES, fast=False),
+        CHUNK_SAMPLES,
+        output=output,
+        display_hold_sec=2.0,
+    )
+    output.client = client
+    client.run()
+    finish(run)
+
+    kinds = [kind for kind, _, _ in output.events]
+    assert kinds[:3] == ["warning", "clear", "caution"]
+    assert kinds.count("warning") == 2
+    levels = [alert["level"] for alert in client.received_alerts]
+    assert levels == ["warning", "caution", "warning"]
+    assert client.received_alerts[2]["rules"] == ["R1", "R2"]
+
+    # 첫 warning 표시부터 clear까지 2초 동안에도 100ms 청크가 계속 나갔다.
+    (_, shown_at, sent_at_show), (_, cleared_at, sent_at_clear) = output.events[:2]
+    assert cleared_at - shown_at >= 1.9
+    assert sent_at_clear - sent_at_show >= 15
+
+    assert client.unmeasured_alerts == 0
+    assert len(client.latencies_ms) == 3
+    assert all(
+        0.0 <= latency < 3000.0 for latency in client.latencies_ms
+    ), client.latencies_ms

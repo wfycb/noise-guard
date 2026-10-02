@@ -23,7 +23,7 @@ from typing import Any, TextIO
 import numpy
 
 import config
-from alert import ConsoleNotifier
+from alert import AlertSink, ConsoleSink, NetworkSink
 from capture import AudioSource, FileSource, MicSource
 from classifier import CedClassifier, resample_for_classifier
 from decision import (
@@ -34,6 +34,7 @@ from decision import (
 )
 from fusion import fuse_measurements
 from level import LevelMeter, leq_db, to_estimated_dba
+from mic_health import MicPresenceTracker
 from models import Alert, Category, Frame, MicMeasurement
 from server_net import AudioServer, ClientSession
 
@@ -70,6 +71,15 @@ class ProducedFrame:
     inference_ms: float
     # 실시간 재생에서 예정 시각(tick) 대비 프레임 완성이 늦은 정도. 누적되면 처리량이 부족한 것이다.
     lag_ms: float | None
+    # 이번 tick에 레벨·분류를 낸 마이크. 빠진 마이크 경고에 쓴다.
+    present_mics: frozenset[str]
+
+
+@dataclass(frozen=True)
+class TickWithoutFrame:
+    """tick은 지났는데 레벨·분류를 낸 마이크가 하나도 없음(시작 직후 또는 전부 빠짐)."""
+
+    timestamp: float
 
 
 class ProducerFinished:
@@ -221,11 +231,20 @@ class FrameProducer(threading.Thread):
             produced = self._measure_and_classify(
                 self._start_timestamp + tick * hop_sec
             )
+            timestamp = self._start_timestamp + tick * hop_sec
             if produced is None:
+                # 소스가 모두 끝나서 데이터가 없는 tick은 마이크 빠짐이 아니라 종료다.
+                if self._stop_when_exhausted and all(
+                    source.exhausted for source in self._sources
+                ):
+                    return
+                self._output_queue.put(TickWithoutFrame(timestamp))
                 continue
             lag_ms = self._lag_ms(tick, pacing_start)
             if lag_ms is not None:
-                produced = ProducedFrame(produced.frame, produced.inference_ms, lag_ms)
+                produced = ProducedFrame(
+                    produced.frame, produced.inference_ms, lag_ms, produced.present_mics
+                )
             self._output_queue.put(produced)
 
     def _lag_ms(self, tick: int, pacing_start: float) -> float | None:
@@ -237,7 +256,7 @@ class FrameProducer(threading.Thread):
         if self._tick_ready_time is not None:
             ready_time = self._tick_ready_time(tick)
             if ready_time is not None:
-                return (time.monotonic() - ready_time) * 1000.0
+                return (time.perf_counter() - ready_time) * 1000.0
         return None
 
     def _measure_and_classify(self, timestamp: float) -> ProducedFrame | None:
@@ -275,7 +294,10 @@ class FrameProducer(threading.Thread):
             for name, result in results.items()
         }
         return ProducedFrame(
-            fuse_measurements(timestamp, measurements), inference_ms, lag_ms=None
+            fuse_measurements(timestamp, measurements),
+            inference_ms,
+            lag_ms=None,
+            present_mics=frozenset(measurements),
         )
 
 
@@ -358,9 +380,10 @@ class RunResult:
     inference_ms: list[float] = field(default_factory=list)
     lag_ms: list[float] = field(default_factory=list)
     overflow_count: int = 0
-    interrupted: bool = (
-        False  # Ctrl+C로 끝났는지 (네트워크 모드에서 다음 연결을 기다릴지 결정)
-    )
+    # Ctrl+C로 끝났는지 (네트워크 모드에서 다음 연결을 기다릴지 결정)
+    interrupted: bool = False
+    # 마이크별로 tick에서 빠진 횟수 (시작 직후 분류 창이 차기 전 tick 포함)
+    missing_ticks: dict[str, int] = field(default_factory=dict)
 
 
 def run_sources(
@@ -368,17 +391,29 @@ def run_sources(
     classifier: CedClassifier,
     engine: NoiseDecisionEngine,
     producer_options: dict[str, Any],
-    notifier: ConsoleNotifier | None,
+    notifier: AlertSink | list[AlertSink] | None,
     logger: CsvRunLogger | None,
 ) -> RunResult:
     """소스를 시작하고 워커가 만든 프레임을 판단·출력·기록한다 (side effect: 장치/파일/출력).
 
     Ctrl+C를 받으면 그때까지의 결과를 반환한다. producer_options는 FrameProducer 인자
     (start_timestamp, realtime_pacing, stop_when_exhausted, duration_sec, tick_ready_time)다.
+    notifier는 출력 하나 또는 여러 개(예: 콘솔 + 네트워크)다.
     """
+    if notifier is None:
+        sinks: list[AlertSink] = []
+    elif isinstance(notifier, list):
+        sinks = notifier
+    else:
+        sinks = [notifier]
     frame_queue: queue.Queue = queue.Queue()
     producer = FrameProducer(sources, classifier, frame_queue, **producer_options)
     result = RunResult()
+    tracker = MicPresenceTracker(
+        [source.name for source in sources],
+        config.MIC_MISSING_WARN_TICKS,
+        config.CLASSIFY_HOP_SEC,
+    )
     for source in sources:
         source.start()
     producer.start()
@@ -392,7 +427,11 @@ def run_sources(
                 break
             if isinstance(item, Exception):
                 raise item
+            if isinstance(item, TickWithoutFrame):
+                report_mic_status(tracker, item.timestamp, frozenset(), sinks)
+                continue
             frame = item.frame
+            report_mic_status(tracker, frame.timestamp, item.present_mics, sinks)
             result.frames.append(frame)
             result.inference_ms.append(item.inference_ms)
             if item.lag_ms is not None:
@@ -400,9 +439,11 @@ def run_sources(
             judged = judge_category(frame.category_probs, config.CLASS_PROB_THRESHOLD)
             alerts = engine.update(frame)
             result.alerts.extend(alerts)
-            if notifier:
-                notifier.show_status(frame, judged)
-                notifier.show_alerts(alerts)
+            for sink in sinks:
+                sink.emit_frame(
+                    frame, judged, tracker.last_active_count, tracker.total_mics
+                )
+                sink.emit(alerts, frame)
             if logger:
                 logger.write_frame(frame, judged)
                 logger.write_alerts(alerts)
@@ -415,20 +456,36 @@ def run_sources(
             source.close()
         producer.join(config.THREAD_JOIN_TIMEOUT_SEC)
         result.overflow_count = sum(source.overflow_count for source in sources)
+        result.missing_ticks = tracker.missing_tick_counts()
     return result
+
+
+def report_mic_status(
+    tracker: MicPresenceTracker,
+    timestamp: float,
+    present_mics: frozenset[str],
+    sinks: list[AlertSink],
+) -> None:
+    """tick 하나의 마이크 참여를 반영하고, 상태가 바뀌었으면 출력한다 (side effect: 출력)."""
+    change = tracker.update(timestamp, set(present_mics))
+    if change is None:
+        return
+    for sink in sinks:
+        sink.emit_mic_status(change)
 
 
 @dataclass
 class SessionRunResult:
     result: RunResult
     session: ClientSession
+    network_sink: NetworkSink
 
 
 def serve_network(
     server: AudioServer,
     classifier: CedClassifier,
     engine: NoiseDecisionEngine,
-    notifier: ConsoleNotifier | None,
+    notifier: AlertSink | None,
     logger: CsvRunLogger | None,
     max_sessions: int | None = None,
 ) -> list[SessionRunResult]:
@@ -441,6 +498,10 @@ def serve_network(
         session = server.next_session(timeout=config.SERVER_THREAD_POLL_SEC)
         if session is None:
             continue
+        network_sink = NetworkSink(session, config.CLASSIFY_HOP_SEC)
+        sinks: list[AlertSink] = (
+            [network_sink] if notifier is None else [notifier, network_sink]
+        )
         result = run_sources(
             session.sources,
             classifier,
@@ -452,7 +513,7 @@ def serve_network(
                 "duration_sec": None,
                 "tick_ready_time": session.stream.tick_ready_time,
             },
-            notifier=notifier,
+            notifier=sinks,
             logger=logger,
         )
         session.close("서버 중단" if result.interrupted else None)
@@ -463,7 +524,7 @@ def serve_network(
             session.close_reason,
             len(result.frames),
         )
-        session_results.append(SessionRunResult(result, session))
+        session_results.append(SessionRunResult(result, session, network_sink))
         if result.interrupted:
             break
     return session_results
@@ -482,6 +543,11 @@ def print_summary(result: RunResult) -> None:
         f"규칙별 {dict(sorted(rule_counts.items()))}"
     )
     print(f"overflow: {result.overflow_count}")
+    if result.missing_ticks:
+        missing_text = ", ".join(
+            f"{name} {count}" for name, count in result.missing_ticks.items()
+        )
+        print(f"마이크별 빠진 tick: {missing_text}")
     if result.inference_ms:
         print(
             f"배치 추론: 평균 {numpy.mean(result.inference_ms):.1f} ms, "
@@ -521,7 +587,7 @@ def run_network_pipeline(
     session_results: list[SessionRunResult] = []
     try:
         session_results = serve_network(
-            server, classifier, engine, ConsoleNotifier(), logger
+            server, classifier, engine, ConsoleSink(), logger
         )
     except KeyboardInterrupt:
         pass
@@ -568,7 +634,7 @@ def run_pipeline(arguments: argparse.Namespace) -> None:
                 and arguments.file_end == "stop",
                 "duration_sec": arguments.duration,
             },
-            notifier=ConsoleNotifier(),
+            notifier=ConsoleSink(),
             logger=logger,
         )
     finally:

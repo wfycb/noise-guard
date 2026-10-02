@@ -46,6 +46,7 @@ class MessageType(IntEnum):
     ALERT = 4
     PING = 5
     PONG = 6
+    STATUS = 7
 
 
 class ProtocolError(Exception):
@@ -358,3 +359,41 @@ def decode_alert(body: bytes) -> dict[str, Any]:
     if missing:
         raise PayloadError(f"ALERT 필수 필드 누락: {missing}")
     return payload
+
+
+# --- STATUS (노트북 → Pi, 마이크 상태가 바뀔 때만) ---
+
+
+@dataclass(frozen=True)
+class StatusMessage:
+    missing_mics: tuple[str, ...]  # MIC_MISSING_WARN_TICKS 연속으로 tick에서 빠진 방
+    active_mics: int  # 이번 tick에 레벨·분류를 낸 마이크 수
+    total_mics: int
+    timestamp: float
+
+
+def encode_status(status: StatusMessage) -> bytes:
+    return encode_json(
+        {
+            "missing_mics": list(status.missing_mics),
+            "active_mics": status.active_mics,
+            "total_mics": status.total_mics,
+            "timestamp": status.timestamp,
+        }
+    )
+
+
+def decode_status(body: bytes) -> StatusMessage:
+    payload = decode_json(body)
+    try:
+        missing = payload["missing_mics"]
+        if not isinstance(missing, list):
+            raise TypeError(f"missing_mics가 목록이 아닙니다: {missing!r}")
+        return StatusMessage(
+            missing_mics=tuple(_require_str(room) for room in missing),
+            active_mics=_require_int(payload["active_mics"]),
+            total_mics=_require_int(payload["total_mics"]),
+            timestamp=float(payload["timestamp"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise PayloadError(f"STATUS 형식이 틀립니다: {error}") from error

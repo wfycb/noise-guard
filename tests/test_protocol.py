@@ -23,15 +23,18 @@ from protocol import (
     MicInfo,
     PayloadError,
     ProtocolError,
+    StatusMessage,
     decode_alert,
     decode_audio,
     decode_hello,
     decode_hello_ack,
+    decode_status,
     encode_alert,
     encode_audio,
     encode_hello,
     encode_hello_ack,
     encode_message,
+    encode_status,
     read_message,
     recv_exact,
     validate_hello,
@@ -381,3 +384,32 @@ def test_framing_and_payload_errors_are_distinct() -> None:
     assert not issubclass(PayloadError, FramingError)
     assert issubclass(FramingError, ProtocolError)
     assert issubclass(PayloadError, ProtocolError)
+
+
+# --- STATUS ---
+
+
+def test_status_round_trip() -> None:
+    status = StatusMessage(("안방", "서재"), 3, 5, 1790000000.5)
+    assert decode_status(encode_status(status)) == status
+
+
+def test_status_survives_framing() -> None:
+    body = encode_status(StatusMessage((), 5, 5, 1.0))
+    stream = encode_message(MessageType.STATUS, body)
+    message = read_message(FragmentedConnection(stream, 3))
+    assert message == Message(MessageType.STATUS, body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"{broken",
+        b'{"missing_mics": "room", "active_mics": 4, "total_mics": 5, "timestamp": 1}',
+        b'{"missing_mics": [], "total_mics": 5, "timestamp": 1}',
+    ],
+    ids=["broken_json", "missing_not_list", "field_missing"],
+)
+def test_bad_status_is_payload_error(body: bytes) -> None:
+    with pytest.raises(PayloadError):
+        decode_status(body)

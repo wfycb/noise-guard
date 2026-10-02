@@ -128,6 +128,8 @@ SERVER_THREAD_POLL_SEC: float = 0.2
 # 종료 시 스레드 join 대기 상한. 넘으면 남은 스레드를 경고로 남긴다.
 THREAD_JOIN_TIMEOUT_SEC: float = 5.0
 THREAD_NAME_PREFIX: str = "noise-guard"
+# 마이크가 이만큼 연속으로 tick에서 빠지면 "마이크 이상"으로 경고하고 Pi에 STATUS를 보낸다.
+MIC_MISSING_WARN_TICKS: int = 3
 
 # --- tools/classify_live.py ---
 # 노트북 내장 마이크 배열의 WASAPI 장치 번호. 장치를 꽂고 빼면 바뀔 수 있으니

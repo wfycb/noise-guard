@@ -116,7 +116,7 @@ class AudioChunkItem:
     seq: int
     flags: int
     samples: numpy.ndarray  # int16
-    capture_time: float  # time.monotonic(), 청크 끝 시점
+    capture_time: float  # time.perf_counter(), 청크 끝 시점 (지연 측정용 고해상도 시계)
 
 
 class ChunkQueue:
@@ -269,7 +269,7 @@ class FileStream:
                 if not self._fast and stop_event.wait(max(0.0, due - time.monotonic())):
                     return
                 item = AudioChunkItem(
-                    mic_index, seq, 0, self._chunk(mic_index, seq), time.monotonic()
+                    mic_index, seq, 0, self._chunk(mic_index, seq), time.perf_counter()
                 )
                 if self._fast:
                     if not chunk_queue.put_blocking(item, stop_event):
@@ -345,7 +345,7 @@ class MicStream:
             self._next_seq[mic_index] += 1
             chunk_queue.put_drop_oldest(
                 AudioChunkItem(
-                    mic_index, seq, flags, input_data[:, 0].copy(), time.monotonic()
+                    mic_index, seq, flags, input_data[:, 0].copy(), time.perf_counter()
                 )
             )
 
